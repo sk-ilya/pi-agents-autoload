@@ -1,7 +1,7 @@
 {
   "name": "pi-agents-autoload",
   "version": "0.1.0",
-  "description": "Automatically load nested AGENTS.md files in Pi",
+  "description": "Progressive, on-demand loading of nested AGENTS.md files for Pi coding agent",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -15,7 +15,13 @@
   "keywords": [
     "pi-package",
     "pi-extension",
-    "agents-md"
+    "pi-coding-agent",
+    "agents-md",
+    "nested-agents-md",
+    "agent-instructions",
+    "context-management",
+    "progressive-context",
+    "autoload"
   ],
   "engines": {
     "node": ">=22.19.0"
