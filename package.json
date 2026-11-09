@@ -1,6 +1,6 @@
 {
   "name": "pi-agents-autoload",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Progressive, on-demand loading of nested AGENTS.md files for Pi coding agent",
   "type": "module",
   "license": "MIT",
