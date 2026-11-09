@@ -1,0 +1,53 @@
+{
+  "name": "pi-agents-autoload",
+  "version": "0.1.0",
+  "description": "Automatically load nested AGENTS.md files in Pi",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sk-ilya/pi-agents-autoload.git"
+  },
+  "homepage": "https://github.com/sk-ilya/pi-agents-autoload#readme",
+  "bugs": {
+    "url": "https://github.com/sk-ilya/pi-agents-autoload/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "agents-md"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "scripts": {
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run lint && npm run typecheck && npm run test"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.3.4",
+    "@earendil-works/pi-agent-core": "1.5.0",
+    "@earendil-works/pi-ai": "1.5.0",
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "@types/node": "^22.19.0",
+    "typescript": "^5.9.3",
+    "vitest": "^5.1.0"
+  }
+}
