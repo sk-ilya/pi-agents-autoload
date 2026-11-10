@@ -10,6 +10,7 @@ import { type Delivery, fileSectionName, renderInstructionBlocks } from "./deliv
 import {
   type DiscoveredFile,
   type DiscoveryResult,
+  isInstructionFileName,
   type KnownFile,
   realpathOrNull,
 } from "./discovery";
@@ -33,7 +34,7 @@ function sectionValue(file: Pick<InstructionFile, "displayPath" | "content">): s
 export interface InstructionFile {
   /**
    * Scoped path of the instruction file (its canonical directory plus
-   * `AGENTS.md`); the deduplication key. Directory aliases collapse onto one
+   * selected filename); the deduplication key. Directory aliases share one
    * key, while symlinks in different scopes stay distinct even when they
    * share a source file.
    */
@@ -69,7 +70,7 @@ export function selectCarryOver(
   hits: ReadonlyMap<string, number>,
   limits: Pick<ExtensionConfig, "maxBytes" | "maxFiles">,
 ): InstructionFile[] {
-  const byKey = new Map(files.map((file) => [file.key, file]));
+  const byDirectory = new Map(files.map((file) => [path.dirname(file.key), file]));
   const selected = new Set<string>();
   const kept: InstructionFile[] = [];
   let bytes = 0;
@@ -87,7 +88,7 @@ export function selectCarryOver(
     let directory = path.dirname(file.key);
     while (path.dirname(directory) !== directory) {
       directory = path.dirname(directory);
-      const parent = byKey.get(path.join(directory, "AGENTS.md"));
+      const parent = byDirectory.get(directory);
       if (parent && !selected.has(parent.key)) parents.unshift(parent);
     }
     if (parents.some((parent) => (hits.get(parent.key) ?? 0) < MIN_HITS)) continue;
@@ -277,7 +278,7 @@ export class InstructionRegistry {
         relative.startsWith(`..${path.sep}`) ||
         path.isAbsolute(relative) ||
         path.dirname(relative) === "." ||
-        path.basename(relative) !== "AGENTS.md" ||
+        !isInstructionFileName(path.basename(relative)) ||
         file.path !== relative.split(path.sep).join("/") ||
         isIgnoredPath(file.path, ignore) ||
         this.activeFiles.has(key)
@@ -326,7 +327,7 @@ export class InstructionRegistry {
         changed = true;
       }
     }
-    for (const key of result.missingKeys) {
+    for (const key of result.inactiveKeys) {
       const existing = this.activeFiles.get(key);
       if (existing === undefined) continue;
       if (existing.delivery === "system") {

@@ -1,5 +1,5 @@
 /**
- * Filesystem discovery of nested AGENTS.md files: path normalization,
+ * Filesystem discovery of nested instruction files: path normalization,
  * canonicalization within the project boundary, symlink containment checks,
  * the directory walk from the first subdirectory below the working
  * directory down to the accessed file's parent, and resolution of read
@@ -13,7 +13,18 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isIgnoredPath } from "./config";
 
-const FILE_NAME = "AGENTS.md";
+// Match Pi's context-file selection order within each directory.
+const INSTRUCTION_FILE_NAMES = [
+  "AGENTS.override.md",
+  "AGENTS.md",
+  "AGENTS.MD",
+  "CLAUDE.md",
+  "CLAUDE.MD",
+] as const;
+
+export function isInstructionFileName(name: string): boolean {
+  return INSTRUCTION_FILE_NAMES.some((candidate) => candidate === name);
+}
 
 /**
  * Lightweight filesystem metadata used to detect changes without
@@ -48,15 +59,10 @@ export interface DiscoveryOptions {
 }
 
 export interface DiscoveryResult {
-  /** Existing instruction files in scope, shallowest first. */
+  /** The selected instruction file in each walked directory, shallowest first. */
   files: DiscoveredFile[];
-  /**
-   * Instruction paths in the walked scope that definitely do not exist as
-   * usable instruction files: missing, replaced by a directory, or symlinked
-   * outside the project. Registry entries for these keys should be removed.
-   * Paths whose existence cannot be determined are reported separately.
-   */
-  missingKeys: string[];
+  /** Paths that are absent, ignored, or superseded by that directory's winner. */
+  inactiveKeys: string[];
   /** Applicable instruction paths that could not be inspected reliably. */
   unverifiedPaths: string[];
 }
@@ -142,17 +148,59 @@ async function scopedInstructionPath(
   cwdReal: string,
 ): Promise<string | undefined> {
   const dir = await canonicalizeWithin(path.dirname(resolvedTarget), cwdReal);
-  return dir === undefined ? undefined : path.join(dir, FILE_NAME);
+  return dir === undefined ? undefined : path.join(dir, path.basename(resolvedTarget));
+}
+
+type InspectedFile =
+  | { kind: "found"; file: DiscoveredFile }
+  | { kind: "missing" }
+  | { kind: "unverified" };
+
+async function inspectInstructionFile(
+  instructionPath: string,
+  cwdReal: string,
+  known?: KnownFile,
+): Promise<InspectedFile> {
+  let stats: Stats;
+  try {
+    stats = await fs.stat(instructionPath);
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? { kind: "missing" }
+      : { kind: "unverified" };
+  }
+  if (!stats.isFile()) return { kind: "missing" };
+  // A linked file belongs to its containing directory, provided its source stays in the project.
+  const sourcePath = await realpathOrNull(instructionPath);
+  if (!sourcePath) return { kind: "unverified" };
+  if (!isWithin(cwdReal, sourcePath)) return { kind: "missing" };
+  const fingerprint = fingerprintOf(stats);
+  let content: string;
+  if (known && sameFingerprint(known.fingerprint, fingerprint)) {
+    content = known.content;
+  } else {
+    try {
+      content = stripBom(await fs.readFile(instructionPath, "utf8"));
+    } catch {
+      return { kind: "unverified" };
+    }
+  }
+  return {
+    kind: "found",
+    file: {
+      key: instructionPath,
+      displayPath: toPosix(path.relative(cwdReal, instructionPath)),
+      content,
+      fingerprint,
+    },
+  };
 }
 
 /**
- * Find AGENTS.md files in every directory from the first subdirectory below
- * `cwd` down to the target's parent, shallowest first. The working directory
- * itself is skipped: Pi loads root and ancestor instruction files at startup.
- * Targets and instruction sources outside `cwd` are ignored; a symlinked
- * instruction file is identified by the directory it is linked from, so two
- * scopes can share one source file. Files matching `ignore` patterns are
- * excluded entirely.
+ * Select Pi's first eligible context file in every directory below `cwd`
+ * through the target's parent, shallowest first. Pi owns root and ancestor
+ * instructions. Symlinked files keep their containing directory's scope;
+ * ignored candidates are skipped so the next candidate can apply.
  */
 export async function discoverInstructionFiles(
   target: string,
@@ -160,113 +208,71 @@ export async function discoverInstructionFiles(
   options?: DiscoveryOptions,
 ): Promise<DiscoveryResult> {
   const files: DiscoveredFile[] = [];
-  const missingKeys: string[] = [];
+  const inactiveKeys: string[] = [];
   const unverifiedPaths: string[] = [];
-  const empty = { files, missingKeys, unverifiedPaths };
+  const result = { files, inactiveKeys, unverifiedPaths };
   const resolvedTarget = resolveToolPath(target, cwd);
-  if (resolvedTarget === undefined) return empty;
+  if (resolvedTarget === undefined) return result;
   const cwdReal = (await realpathOrNull(cwd)) ?? path.resolve(cwd);
-  const canonicalTarget =
-    path.basename(resolvedTarget) === FILE_NAME
-      ? await scopedInstructionPath(resolvedTarget, cwdReal)
-      : await canonicalizeWithin(resolvedTarget, cwdReal);
-  if (canonicalTarget === undefined) return empty;
+  const canonicalTarget = isInstructionFileName(path.basename(resolvedTarget))
+    ? await scopedInstructionPath(resolvedTarget, cwdReal)
+    : await canonicalizeWithin(resolvedTarget, cwdReal);
+  if (canonicalTarget === undefined) return result;
 
   const relParent = path.relative(cwdReal, path.dirname(canonicalTarget));
-  if (relParent === "") return empty;
+  if (relParent === "") return result;
   const segments = relParent.split(path.sep).filter((segment) => segment !== "" && segment !== ".");
-  if (segments.some((segment) => segment === "..")) return empty;
+  if (segments.some((segment) => segment === "..")) return result;
 
   for (let depth = 1; depth <= segments.length; depth++) {
     const dir = path.join(cwdReal, ...segments.slice(0, depth));
-    const instructionPath = path.join(dir, FILE_NAME);
-    const displayPath = toPosix(path.relative(cwdReal, instructionPath));
-    if (isIgnoredPath(displayPath, options?.ignore ?? [])) continue;
-    let stats: Stats | undefined;
-    try {
-      stats = await fs.stat(instructionPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        missingKeys.push(instructionPath);
-      } else {
+    const candidates = INSTRUCTION_FILE_NAMES.map((name) => path.join(dir, name));
+    let winner: DiscoveredFile | undefined;
+    let unverified = false;
+    for (const instructionPath of candidates) {
+      const displayPath = toPosix(path.relative(cwdReal, instructionPath));
+      if (isIgnoredPath(displayPath, options?.ignore ?? [])) continue;
+      const inspected = await inspectInstructionFile(
+        instructionPath,
+        cwdReal,
+        options?.known?.get(instructionPath),
+      );
+      if (inspected.kind === "unverified") {
         unverifiedPaths.push(instructionPath);
+        unverified = true;
+        break;
       }
-      continue;
-    }
-    if (!stats.isFile()) {
-      missingKeys.push(instructionPath);
-      continue;
-    }
-    // The instruction file may itself be a symlink. Its identity and scope are
-    // the directory being walked; resolve the symlink only for the boundary
-    // check, so sources outside the project are ignored.
-    const sourcePath = await realpathOrNull(instructionPath);
-    if (!sourcePath) {
-      unverifiedPaths.push(instructionPath);
-      continue;
-    }
-    if (!isWithin(cwdReal, sourcePath)) {
-      missingKeys.push(instructionPath);
-      continue;
-    }
-    const fingerprint = fingerprintOf(stats);
-    const known = options?.known?.get(instructionPath);
-    let content: string;
-    if (known && sameFingerprint(known.fingerprint, fingerprint)) {
-      // Metadata unchanged: reuse the cached content instead of re-reading.
-      content = known.content;
-    } else {
-      try {
-        content = stripBom(await fs.readFile(instructionPath, "utf8"));
-      } catch {
-        unverifiedPaths.push(instructionPath);
-        continue;
+      if (inspected.kind === "found") {
+        winner = inspected.file;
+        files.push(winner);
+        break;
       }
     }
-    files.push({ key: instructionPath, displayPath, content, fingerprint });
+    // An uncertain higher-priority candidate leaves this directory's active state intact.
+    if (!unverified) {
+      inactiveKeys.push(...candidates.filter((candidate) => candidate !== winner?.key));
+    }
   }
-  return empty;
+  return result;
 }
 
 /**
- * Resolve the read target itself when it is a nested instruction file: the
- * same scoped key, display path, content, and fingerprint that discovery
- * would report for it. The directory holding a symlinked instruction file
- * defines its scope. Returns undefined for non-instruction targets, the root
- * instruction file (Pi loads it natively), targets outside the working
- * directory, and files that violate the symlink containment rules or cannot
- * be read.
+ * Inspect a directly read nested context file using the same scoped identity
+ * as discovery. Root and ancestor files remain Pi's responsibility.
  */
 export async function resolveInstructionTarget(
   target: string,
   cwd: string,
 ): Promise<DiscoveredFile | undefined> {
   const resolvedTarget = resolveToolPath(target, cwd);
-  if (resolvedTarget === undefined || path.basename(resolvedTarget) !== FILE_NAME) return undefined;
+  if (resolvedTarget === undefined || !isInstructionFileName(path.basename(resolvedTarget))) {
+    return undefined;
+  }
   const cwdReal = (await realpathOrNull(cwd)) ?? path.resolve(cwd);
   const canonicalTarget = await scopedInstructionPath(resolvedTarget, cwdReal);
   if (canonicalTarget === undefined || path.dirname(canonicalTarget) === cwdReal) return undefined;
-  let stats: Stats | undefined;
-  try {
-    stats = await fs.stat(canonicalTarget);
-  } catch {
-    return undefined;
-  }
-  if (!stats.isFile()) return undefined;
-  const sourcePath = await realpathOrNull(canonicalTarget);
-  if (!sourcePath || !isWithin(cwdReal, sourcePath)) return undefined;
-  let content: string;
-  try {
-    content = stripBom(await fs.readFile(canonicalTarget, "utf8"));
-  } catch {
-    return undefined;
-  }
-  return {
-    key: canonicalTarget,
-    displayPath: toPosix(path.relative(cwdReal, canonicalTarget)),
-    content,
-    fingerprint: fingerprintOf(stats),
-  };
+  const inspected = await inspectInstructionFile(canonicalTarget, cwdReal);
+  return inspected.kind === "found" ? inspected.file : undefined;
 }
 
 /** Project-relative where possible, `~` under the home directory, else absolute. */

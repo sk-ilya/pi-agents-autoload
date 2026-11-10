@@ -1,6 +1,6 @@
 # pi-agents-autoload
 
-Progressive `AGENTS.md` discovery and loading for [Pi](https://github.com/badlogic/pi-mono).
+Progressive discovery and loading of nested context files for [Pi](https://github.com/badlogic/pi-mono).
 
 Pi loads instructions from the working directory and its ancestors at startup. This extension discovers nested `AGENTS.md` files as the agent works, loading only relevant instructions instead of including them all in the initial context.
 
@@ -8,12 +8,11 @@ Tested with Pi 1.5.2.
 
 ## Features
 
-- **Safe edits and writes** - Ensures applicable instructions reach the agent before file modifications, including parallel tool calls.
-- **Model-aware delivery** - Uses system-prompt updates where supported, with a cache-friendly tool-result fallback.
-- **Selective compaction carry-over** - Keeps frequently accessed instructions within a shared content budget.
-- **Automatic refresh** - Detects changed or deleted instructions on subsequent file accesses without redundant prompt updates.
-- **Session persistence** - Restores instructions across session resumption and branch navigation.
-- **Configurable exclusions** - Supports glob patterns to exclude selected instructions from automatic loading.
+- **Automatic loading** - Inject instructions when the agent accesses files in nested directories.
+- **Safe edits and writes** - Show new or changed instructions before a file is modified.
+- **System-level delivery** - Deliver instructions as mid-conversation system messages on supported models.
+- **Selective compaction carry-over** - Keep the most-used instructions after compaction, within a size limit.
+- **Automatic refresh** - Pick up changed or deleted instructions on the next relevant access.
 
 ## Installation
 
@@ -44,19 +43,23 @@ project/
     └── app.test.ts
 ```
 
-Reading `src/app.ts` loads `src/AGENTS.md`. Accessing `tests/app.test.ts` loads its instructions separately. Applicable instructions are loaded from parent to child, without duplicates.
+Reading `src/app.ts` loads `src/AGENTS.md`. Reading `tests/app.test.ts` loads `tests/AGENTS.md` separately. Applicable instructions from parent directories load first.
 
-If an edit or write uncovers new or changed instructions, the agent sees them before it can retry. If an applicable instruction file cannot be read, the edit or write remains blocked. Reading an `AGENTS.md` file directly does not load a second copy.
+In each nested directory, the extension checks `AGENTS.override.md`, `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, and `CLAUDE.MD` in that order and loads the first one it finds.
 
-The extension checks for changes when a relevant file is accessed and leaves the prompt alone when instructions are unchanged. On supported models, new instructions appear after the access that found them, preserving the earlier conversation for prompt caching.
+If an edit or write finds new or changed instructions, it is blocked until the agent has seen them and retries. An unreadable applicable instruction file also blocks the change. Reading the selected instruction file directly does not add a second copy.
 
-**Retention:** Successful file accesses add hits to the instructions they use.
+The extension checks for changes on later file accesses. By default, supported models receive new instructions as system messages after the access that found them; other models receive them in tool results. Earlier messages stay in place.
 
-At compaction, instructions with at least four hits may stay in the prompt. By default, the extension keeps the most-used files within a shared 50 KiB limit. Nested files must be kept with their managed parents; Pi's own startup instructions are outside the limit. Hits reset after compaction, and dropped files can be loaded again on a later access.
+## Retention
+
+Each successful file access adds a hit to the nested instructions it uses. At compaction, files with at least four hits can stay, most-used first, within a shared 50 KiB default limit. A nested file stays only if its managed parent instructions stay too.
+
+Hits reset after compaction. Files that did not stay can load again on a later access. Pi's startup instructions are outside this limit.
 
 ## Configuration
 
-Configuration is optional:
+The defaults work for most projects, so configuration is optional.
 
 | Scope   | Path                                  |
 | ------- | ------------------------------------- |
@@ -74,9 +77,12 @@ Example:
 }
 ```
 
-Each setting resolves independently: trusted project configuration overrides global configuration, which overrides the defaults (`mode: "auto"`, `ignore: []`, `maxBytes: 51200`, `maxFiles: 0`). `maxBytes` caps the combined UTF-8 content of selected managed files; `maxFiles` caps their count. Both accept non-negative safe integers, with `0` meaning unlimited. An empty project `ignore` array overrides the global list.
+- `mode` chooses how instructions reach the agent. Default: `auto`. The modes are described below.
+- `ignore` lists instruction paths to skip. Default: an empty list.
+- `maxBytes` limits the combined size of instructions kept after compaction. Default: `51200` (50 KiB); `0` removes the limit.
+- `maxFiles` limits how many instruction files are kept. Default: `0` (no limit).
 
-Invalid configuration is reported through Pi's extension errors, and the session falls back to defaults.
+A trusted project's settings override global settings one field at a time. A project `ignore` list replaces the global list rather than combining with it. Invalid configuration is reported as an extension error, and the session uses defaults.
 
 ### Delivery modes
 
@@ -88,18 +94,16 @@ Invalid configuration is reported through Pi's extension errors, and the session
 
 ### Ignore patterns
 
-`ignore` accepts glob patterns matched against project-relative `AGENTS.md` paths, using Node's `path.matchesGlob()`.
+`ignore` patterns match project-relative instruction paths using Node's `path.matchesGlob()`. Ignoring one filename lets the next file in that directory's order be selected. A directory pattern skips instruction files throughout that directory.
 
-Ignored instructions are not automatically loaded and do not block edits or writes. They can still be read explicitly. Ignoring a parent `AGENTS.md` does not exclude nested instruction files.
-
-Configuration reloads also remove newly ignored instructions from the active state. Root and ancestor instructions loaded natively by Pi are unaffected.
+Ignored files can still be read explicitly and do not block edits or writes. Ignoring a parent file does not ignore files in child directories. A configuration reload removes newly ignored files from active instructions. Pi's startup instructions are unaffected.
 
 ## Status
 
 New or updated instructions produce a notification:
 
 ```text
-AGENTS.md loaded (~120 tokens):
+Instructions loaded (~120 tokens):
   src/AGENTS.md
 ```
 
@@ -107,10 +111,10 @@ Use `/agents-md-status` to see loaded files, hit counts, the current mode, and w
 
 ## Limitations
 
-- Discovery operates through Pi's built-in `read`, `edit`, and `write` tools, not shell commands, MCP, or custom tools.
-- Only nested instructions within the working directory are managed. Symlinks pointing outside it are ignored.
-- Changes are detected on relevant file accesses, not continuously. Metadata-based checks may miss a same-size rewrite if file timestamps do not change.
-- Recent tool results, explicit reads of `AGENTS.md`, quoted instructions, and compaction summaries can remain model-visible even when a file is not selected for system carry-over.
+- Discovery works with Pi's built-in `read`, `edit`, and `write` tools, not shell commands, MCP, or custom tools.
+- Only nested files inside the working directory are managed. Symlinks pointing outside it are ignored.
+- Changes are checked on relevant file accesses, not continuously. A same-size rewrite with unchanged file timestamps may be missed.
+- Recent tool results, explicit reads, quoted instructions, and compaction summaries may still show instructions even when a file is not carried over.
 
 ## Development
 

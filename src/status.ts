@@ -51,8 +51,11 @@ export function formatStatus(input: StatusInput): string {
     `Mode: ${input.configuredMode} (${input.modeOrigin}) → ${input.effectiveMode}`;
   const header =
     input.ignorePatterns > 0
-      ? [`AGENTS.md: ${input.modelLabel}`, `${modeLine} | Ignore patterns: ${input.ignorePatterns}`]
-      : [`AGENTS.md: ${input.modelLabel}`, modeLine];
+      ? [
+          `Instructions: ${input.modelLabel}`,
+          `${modeLine} | Ignore patterns: ${input.ignorePatterns}`,
+        ]
+      : [`Instructions: ${input.modelLabel}`, modeLine];
   const nativeTokens = input.nativeFiles.reduce(
     (total, file) => total + estimateTokens(file.content),
     0,
@@ -69,7 +72,7 @@ export function formatStatus(input: StatusInput): string {
   const files = input.maxFiles === 0 ? "files unlimited" : `up to ${input.maxFiles} files`;
   const lines = [...header, `Carry-over: ${MIN_HITS}+ hits | ${budget} total | ${files}`];
   if (input.nativeFiles.length + input.nestedFiles.length === 0) {
-    return `${lines.join("\n")}\n\nNo AGENTS.md files loaded.`;
+    return `${lines.join("\n")}\n\nNo instruction files loaded.`;
   }
 
   const nativePaths = input.nativeFiles.map((file) =>
@@ -139,5 +142,5 @@ export function notifyDiscovered(ctx: ExtensionContext, files: readonly Instruct
   const tokens = files.reduce((total, file) => total + estimateTokens(file.content), 0);
   const paths = files.map((file) => `  ${file.displayPath}`).join("\n");
 
-  ctx.ui.notify(`AGENTS.md loaded (~${tokens} tokens):\n${paths}`, "info");
+  ctx.ui.notify(`Instructions loaded (~${tokens} tokens):\n${paths}`, "info");
 }

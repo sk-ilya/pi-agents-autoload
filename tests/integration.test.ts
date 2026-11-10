@@ -37,6 +37,101 @@ import {
 } from "./helpers";
 
 describe("delivery and blocking", () => {
+  it("keeps Pi's native root winner and loads the selected nested file", {
+    timeout: 30000,
+  }, async () => {
+    const project = makeProject();
+    let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+    try {
+      project.write("AGENTS.override.md", "root override");
+      project.write("AGENTS.md", "root agents");
+      project.write("CLAUDE.md", "root claude");
+      project.write("tests/CLAUDE.md", "nested claude");
+      project.write("tests/file.txt", "x");
+      harness = await createHarness({
+        cwd: project.dir,
+        model: fauxModel({ supportsMidConvoSystemMessages: true }),
+        responses: [readCall("tests/file.txt"), assistantText("done")],
+      });
+      await harness.session.prompt("read the file");
+      expect(nativeSectionOf(harness.faux.requests[0])).toContain("root override");
+      expect(nativeSectionOf(harness.faux.requests[0])).not.toContain("root agents");
+      expect(nativeSectionOf(harness.faux.requests[0])).not.toContain("root claude");
+      expect(sectionOf(harness.faux.requests[1])).toContain("nested claude");
+      expect(sectionOf(harness.faux.requests[1])).not.toContain("root override");
+    } finally {
+      harness?.cleanup();
+      project.cleanup();
+    }
+  });
+
+  it("replaces a selected system file and restores its fallback on later access", {
+    timeout: 30000,
+  }, async () => {
+    const project = makeProject();
+    let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+    try {
+      project.write("tests/CLAUDE.md", "claude fallback");
+      project.write("tests/file.txt", "x");
+      harness = await createHarness({
+        cwd: project.dir,
+        model: fauxModel({ supportsMidConvoSystemMessages: true }),
+        responses: [
+          readCall("tests/file.txt"),
+          assistantText("first"),
+          readCall("tests/file.txt"),
+          assistantText("second"),
+          readCall("tests/file.txt"),
+          assistantText("third"),
+        ],
+      });
+      await harness.session.prompt("read the file");
+      expect(sectionOf(harness.faux.requests[1])).toContain("claude fallback");
+      project.write("tests/AGENTS.md", "agents winner");
+      await harness.session.prompt("read it again");
+      expect(sectionOf(harness.faux.requests[3])).toContain("agents winner");
+      expect(sectionOf(harness.faux.requests[3])).not.toContain("claude fallback");
+      rmSync(project.path("tests/AGENTS.md"));
+      await harness.session.prompt("read it once more");
+      expect(sectionOf(harness.faux.requests[5])).toContain("claude fallback");
+      expect(sectionOf(harness.faux.requests[5])).not.toContain("agents winner");
+    } finally {
+      harness?.cleanup();
+      project.cleanup();
+    }
+  });
+
+  it("blocks an edit for the selected override, not lower-priority files", {
+    timeout: 30000,
+  }, async () => {
+    const project = makeProject();
+    let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+    try {
+      project.write("tests/AGENTS.override.md", "override rules");
+      project.write("tests/AGENTS.md", "agents rules");
+      project.write("tests/target.txt", "alpha");
+      const args = { path: "tests/target.txt", edits: [{ oldText: "alpha", newText: "beta" }] };
+      harness = await createHarness({
+        cwd: project.dir,
+        model: fauxModel(),
+        responses: [
+          assistantToolCalls([{ name: "edit", args }]),
+          assistantToolCalls([{ name: "edit", args }]),
+          assistantText("done"),
+        ],
+      });
+      await harness.session.prompt("edit the file");
+      const texts = toolResultTexts(harness.sessionManager);
+      expect(texts[0]).toContain("override rules");
+      expect(texts[0]).not.toContain("agents rules");
+      expect(texts[1]).not.toContain("Blocked:");
+      expect(project.read("tests/target.txt")).toBe("beta");
+    } finally {
+      harness?.cleanup();
+      project.cleanup();
+    }
+  });
+
   it("appends discovered instructions to read results in deferred mode without duplicating the root", {
     timeout: 30000,
   }, async () => {
@@ -767,7 +862,7 @@ describe("/agents-md-status", () => {
       expect(notifications).toHaveLength(1);
       expect(notifications[0]).toContain("faux/faux-1");
       expect(notifications[0]).toContain("Mid-convo system: no | Mode: auto (default) → deferred");
-      expect(notifications[0]).toContain("No AGENTS.md files loaded.");
+      expect(notifications[0]).toContain("No instruction files loaded.");
     } finally {
       harness?.cleanup();
       project.cleanup();
@@ -830,7 +925,7 @@ describe("discovery notifications", () => {
       await harness.session.prompt("read the file");
 
       expect(notifications).toHaveLength(1);
-      expect(notifications[0]).toMatch(/AGENTS\.md loaded \(~\d+ tokens\):/);
+      expect(notifications[0]).toMatch(/Instructions loaded \(~\d+ tokens\):/);
       const first = notifications[0].indexOf("tests/AGENTS.md");
       const second = notifications[0].indexOf("tests/integration/AGENTS.md");
       expect(first).toBeGreaterThan(-1);
@@ -860,7 +955,7 @@ describe("discovery notifications", () => {
       await harness.session.prompt("read both files");
 
       expect(notifications).toHaveLength(1);
-      expect(notifications[0]).toMatch(/AGENTS\.md loaded \(~\d+ tokens\):/);
+      expect(notifications[0]).toMatch(/Instructions loaded \(~\d+ tokens\):/);
       expect(notifications[0]).toContain("  tests/AGENTS.md");
     } finally {
       harness?.cleanup();
@@ -884,7 +979,7 @@ describe("discovery notifications", () => {
       await harness.session.prompt("read the file");
 
       expect(notifications).toHaveLength(1);
-      expect(notifications[0]).toMatch(/AGENTS\.md loaded \(~\d+ tokens\):/);
+      expect(notifications[0]).toMatch(/Instructions loaded \(~\d+ tokens\):/);
       expect(notifications[0]).toContain("  tests/AGENTS.md");
     } finally {
       harness?.cleanup();
@@ -978,7 +1073,7 @@ describe("discovery notifications", () => {
       await harness.session.prompt("edit the file");
 
       expect(notifications).toHaveLength(1);
-      expect(notifications[0]).toMatch(/AGENTS\.md loaded \(~\d+ tokens\):/);
+      expect(notifications[0]).toMatch(/Instructions loaded \(~\d+ tokens\):/);
       // First-write protection is unchanged.
       const texts = toolResultTexts(harness.sessionManager);
       expect(texts[0]).toContain("Blocked:");
@@ -1313,6 +1408,67 @@ describe("parallel tool batches", () => {
 // ---------------------------------------------------------------------------
 
 describe("explicit instruction reads", () => {
+  it("loads the winner when a lower-priority file is read directly", {
+    timeout: 30000,
+  }, async () => {
+    const project = makeProject();
+    let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+    try {
+      project.write("tests/AGENTS.override.md", "selected override");
+      project.write("tests/CLAUDE.md", "unselected claude");
+      project.write("tests/target.txt", "alpha");
+      const args = { path: "tests/target.txt", edits: [{ oldText: "alpha", newText: "beta" }] };
+      harness = await createHarness({
+        cwd: project.dir,
+        model: fauxModel(),
+        responses: [
+          readCall("tests/CLAUDE.md"),
+          assistantToolCalls([{ name: "edit", args }]),
+          assistantText("done"),
+        ],
+      });
+      await harness.session.prompt("read claude and edit the file");
+      const texts = toolResultTexts(harness.sessionManager);
+      expect(texts[0].split("unselected claude")).toHaveLength(2);
+      expect(texts[0]).toContain('path="tests/AGENTS.override.md"');
+      expect(texts[1]).not.toContain("Blocked:");
+      expect(project.read("tests/target.txt")).toBe("beta");
+    } finally {
+      harness?.cleanup();
+      project.cleanup();
+    }
+  });
+
+  it("registers a complete uppercase CLAUDE.MD read as delivered", {
+    timeout: 30000,
+  }, async () => {
+    const project = makeProject();
+    let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+    try {
+      project.write("tests/CLAUDE.MD", "uppercase claude");
+      project.write("tests/target.txt", "alpha");
+      const args = { path: "tests/target.txt", edits: [{ oldText: "alpha", newText: "beta" }] };
+      harness = await createHarness({
+        cwd: project.dir,
+        model: fauxModel(),
+        responses: [
+          readCall("tests/CLAUDE.MD"),
+          assistantToolCalls([{ name: "edit", args }]),
+          assistantText("done"),
+        ],
+      });
+      await harness.session.prompt("read the instructions and edit");
+      const texts = toolResultTexts(harness.sessionManager);
+      expect(texts[0].split("uppercase claude")).toHaveLength(2);
+      expect(texts[0]).not.toContain(DEFERRED_LEAD_IN);
+      expect(texts[1]).not.toContain("Blocked:");
+      expect(project.read("tests/target.txt")).toBe("beta");
+    } finally {
+      harness?.cleanup();
+      project.cleanup();
+    }
+  });
+
   it("does not duplicate an explicitly read instruction file in its read result", {
     timeout: 30000,
   }, async () => {
@@ -1625,7 +1781,7 @@ describe("explicit instruction reads", () => {
 
       notifications.length = 0;
       await harness.session.prompt("/agents-md-status");
-      expect(notifications[0]).toContain("No AGENTS.md files loaded.");
+      expect(notifications[0]).toContain("No instruction files loaded.");
     } finally {
       harness?.cleanup();
       project.cleanup();

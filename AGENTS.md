@@ -1,7 +1,10 @@
 # pi-agents-autoload development
 
-Pi extension that loads nested `AGENTS.md` files on demand. The
-implementation lives in `src/`, split by responsibility (`index.ts` hook
+Pi extension that loads nested context files on demand. Within each nested
+directory it selects the first eligible file in Pi's native order:
+`AGENTS.override.md`, `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, `CLAUDE.MD`.
+Root and ancestor files remain Pi's responsibility. The implementation lives
+in `src/`, split by responsibility (`index.ts` hook
 wiring, `config.ts`, `discovery.ts`, `instructions.ts`, `delivery.ts`,
 `status.ts`); tests in `tests/` run against a real `AgentSession` with a
 scripted model.

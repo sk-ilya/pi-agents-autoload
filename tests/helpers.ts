@@ -8,7 +8,7 @@ import type { ExtensionUIContext, SessionManager } from "@earendil-works/pi-codi
 import { FILE_SECTION_PREFIX } from "../src/delivery";
 import { assistantToolCalls, type Project } from "./harness";
 
-export const DEFERRED_LEAD_IN = "Discovered nested AGENTS.md instructions";
+export const DEFERRED_LEAD_IN = "Discovered nested context-file instructions";
 export const NESTED_MARKER = 'path="tests/AGENTS.md"';
 
 /** Text content of every tool result on the current branch, in order. */

@@ -14,6 +14,50 @@ import { makeProject } from "./harness";
 import { writeFixture } from "./helpers";
 
 describe("discoverInstructionFiles", () => {
+  it("selects the first usable file in Pi's order for each nested directory", async () => {
+    const project = makeProject();
+    try {
+      project.write("AGENTS.override.md", "native override");
+      project.write("tests/file.txt", "x");
+      const names = ["CLAUDE.MD", "CLAUDE.md", "AGENTS.MD", "AGENTS.md", "AGENTS.override.md"];
+      for (const name of names) {
+        project.write(`tests/${name}`, name);
+        const result = await discoverInstructionFiles("tests/file.txt", project.dir);
+        expect(result.files.map((file) => file.displayPath)).toEqual([`tests/${name}`]);
+        expect(result.inactiveKeys).not.toContain(project.path(`tests/${name}`));
+        expect(result.files[0]?.content).toBe(name);
+      }
+    } finally {
+      project.cleanup();
+    }
+  });
+
+  it("falls back when the winner disappears or an exact path is ignored", async () => {
+    const project = makeProject();
+    try {
+      project.write("tests/AGENTS.override.md", "override");
+      project.write("tests/AGENTS.md", "agents");
+      project.write("tests/CLAUDE.md", "claude");
+      project.write("tests/file.txt", "x");
+      const first = await discoverInstructionFiles("tests/file.txt", project.dir);
+      expect(first.files.map((file) => file.displayPath)).toEqual(["tests/AGENTS.override.md"]);
+      expect(first.inactiveKeys).toContain(project.path("tests/AGENTS.md"));
+      const ignored = await discoverInstructionFiles("tests/file.txt", project.dir, {
+        ignore: ["tests/AGENTS.override.md"],
+      });
+      expect(ignored.files.map((file) => file.displayPath)).toEqual(["tests/AGENTS.md"]);
+      rmSync(project.path("tests/AGENTS.override.md"));
+      rmSync(project.path("tests/AGENTS.md"));
+      expect(
+        (await discoverInstructionFiles("tests/file.txt", project.dir)).files.map(
+          (file) => file.displayPath,
+        ),
+      ).toEqual(["tests/CLAUDE.md"]);
+    } finally {
+      project.cleanup();
+    }
+  });
+
   it("discovers nested AGENTS.md files from shallowest to deepest and skips the root", async () => {
     const project = makeProject();
     try {
@@ -158,9 +202,8 @@ describe("discoverInstructionFiles", () => {
 
       const result = await discoverInstructionFiles("tests/file.txt", project.dir);
       expect(result.files).toEqual([]);
-      // The containment violation is reported as missing so an active entry
-      // for the scoped path is removed.
-      expect(result.missingKeys).toEqual([project.path("tests/AGENTS.md")]);
+      // The containment violation deactivates the scoped path.
+      expect(result.inactiveKeys).toContain(project.path("tests/AGENTS.md"));
     } finally {
       project.cleanup();
       outside.cleanup();
@@ -319,7 +362,7 @@ describe("missing instruction files", () => {
       rmSync(project.path("tests/AGENTS.md"));
       const after = await discoverInstructionFiles("tests/file.txt", project.dir);
       expect(after.files).toEqual([]);
-      expect(after.missingKeys).toEqual([project.path("tests/AGENTS.md")]);
+      expect(after.inactiveKeys).toContain(project.path("tests/AGENTS.md"));
     } finally {
       project.cleanup();
     }
@@ -335,12 +378,31 @@ describe("missing instruction files", () => {
         chmodSync(instructions, 0o000);
         const result = await discoverInstructionFiles("tests/file.txt", project.dir);
         expect(result.files).toEqual([]);
-        expect(result.missingKeys).toEqual([]);
+        expect(result.inactiveKeys).toEqual([]);
         expect(result.unverifiedPaths).toEqual([instructions]);
         const ignored = await discoverInstructionFiles("tests/file.txt", project.dir, {
           ignore: ["tests/AGENTS.md"],
         });
         expect(ignored.unverifiedPaths).toEqual([]);
+      } finally {
+        project.cleanup();
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "keeps a directory unresolved when its higher-priority file is unreadable",
+    async () => {
+      const project = makeProject();
+      try {
+        const override = project.write("tests/AGENTS.override.md", "override rules");
+        project.write("tests/CLAUDE.md", "fallback rules");
+        project.write("tests/file.txt", "x");
+        chmodSync(override, 0o000);
+        const result = await discoverInstructionFiles("tests/file.txt", project.dir);
+        expect(result.files).toEqual([]);
+        expect(result.inactiveKeys).toEqual([]);
+        expect(result.unverifiedPaths).toEqual([override]);
       } finally {
         project.cleanup();
       }
@@ -357,7 +419,7 @@ describe("missing instruction files", () => {
 
       const result = await discoverInstructionFiles("tests/file.txt", project.dir);
       expect(result.files).toEqual([]);
-      expect(result.missingKeys).toEqual([project.path("tests/AGENTS.md")]);
+      expect(result.inactiveKeys).toContain(project.path("tests/AGENTS.md"));
     } finally {
       project.cleanup();
     }
@@ -372,7 +434,8 @@ describe("missing instruction files", () => {
       rmSync(project.path("tests/AGENTS.md"));
 
       const result = await discoverInstructionFiles("tests/file.txt", project.dir);
-      expect(result.missingKeys).toEqual([project.path("tests/AGENTS.md")]);
+      expect(result.inactiveKeys).toContain(project.path("tests/AGENTS.md"));
+      expect(result.inactiveKeys).not.toContain(project.path("other/AGENTS.md"));
     } finally {
       project.cleanup();
     }
@@ -439,6 +502,11 @@ describe("resolveInstructionTarget", () => {
       project.write("tests/file.txt", "x");
 
       expect(await resolveInstructionTarget("AGENTS.md", project.dir)).toBeUndefined();
+      expect(await resolveInstructionTarget("CLAUDE.md", project.dir)).toBeUndefined();
+      project.write("tests/CLAUDE.MD", "nested claude");
+      expect((await resolveInstructionTarget("tests/CLAUDE.MD", project.dir))?.content).toBe(
+        "nested claude",
+      );
       expect(await resolveInstructionTarget("tests/file.txt", project.dir)).toBeUndefined();
       expect(await resolveInstructionTarget("tests/missing.md", project.dir)).toBeUndefined();
       expect(

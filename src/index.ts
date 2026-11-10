@@ -1,4 +1,4 @@
-/** Load nested AGENTS.md instructions when Pi accesses files below the project root. */
+/** Load nested context files when Pi accesses files below the project root. */
 
 import { homedir } from "node:os";
 import type { ImageContent, SystemMessage, TextContent } from "@earendil-works/pi-ai";
@@ -125,13 +125,13 @@ export default function piAgentsMd(pi: ExtensionAPI): void {
       return {
         block: true,
         reason:
-          "Blocked: could not inspect nested AGENTS.md instructions for this path. Retry the operation.",
+          "Blocked: could not inspect nested instructions for this path. Retry the operation.",
       };
     }
     if (result.unverifiedPaths.length > 0) {
       return {
         block: true,
-        reason: `Blocked: could not inspect nested AGENTS.md instructions at ${result.unverifiedPaths.join(", ")}. Fix access and retry the operation.`,
+        reason: `Blocked: could not inspect nested instructions at ${result.unverifiedPaths.join(", ")}. Fix access and retry the operation.`,
       };
     }
     const { added, updated } = registry.observeDiscovered(result, deliveryForNewFiles(ctx));
@@ -150,8 +150,8 @@ export default function piAgentsMd(pi: ExtensionAPI): void {
   });
 
   // Successful reads deliver discovered instructions in their result. A
-  // complete read of AGENTS.md already carries its instructions, so it is
-  // registered without appending a second copy.
+  // complete read of the selected context file already carries its instructions,
+  // so it is registered without appending a second copy.
   pi.on("tool_result", async (event, ctx) => {
     if (event.isError) return;
     if (event.toolName === "edit" || event.toolName === "write") {
@@ -177,7 +177,8 @@ export default function piAgentsMd(pi: ExtensionAPI): void {
       return;
     }
     const explicit = await resolveInstructionTarget(target, ctx.cwd);
-    const discovered = explicit
+    const explicitIsWinner = explicit && result.files.some((file) => file.key === explicit.key);
+    const discovered = explicitIsWinner
       ? result.files.filter((file) => file.key !== explicit.key)
       : result.files;
     const { added, updated } = registry.observeDiscovered(
@@ -196,17 +197,14 @@ export default function piAgentsMd(pi: ExtensionAPI): void {
         ? event.content[0].text.replace(/^\uFEFF/, "")
         : undefined;
     if (
-      explicit &&
+      explicitIsWinner &&
       completeRead &&
       deliveredText === explicit.content &&
       !isIgnoredPath(explicit.displayPath, config.ignore)
     ) {
       registry.registerDelivered(explicit);
     }
-    registry.recordHits([
-      ...result.files.map((file) => file.key),
-      ...(explicit && completeRead && deliveredText === explicit.content ? [explicit.key] : []),
-    ]);
+    registry.recordHits(result.files.map((file) => file.key));
     notifyDiscovered(ctx, [...added, ...updated]);
 
     const deliver = [...added, ...updated].filter((file) => file.delivery === "toolResult");
@@ -346,7 +344,7 @@ export default function piAgentsMd(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("agents-md-status", {
-    description: "Show AGENTS.md files, hit counts, and compaction carry-over",
+    description: "Show context files, hit counts, and compaction carry-over",
     handler: async (_args, ctx) => {
       ctx.ui.notify(
         formatStatus({

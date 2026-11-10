@@ -613,6 +613,42 @@ describe("ignore configuration", () => {
     }
   });
 
+  it("selects the next file when a reload ignores the previous winner", {
+    timeout: 30000,
+  }, async () => {
+    const project = makeProject();
+    let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+    try {
+      project.write("tests/AGENTS.override.md", "original winner");
+      project.write("tests/CLAUDE.md", "fallback winner");
+      project.write("tests/file.txt", "x");
+      harness = await createHarness({
+        cwd: project.dir,
+        trusted: true,
+        model: fauxModel({ supportsMidConvoSystemMessages: true }),
+        responses: [
+          readCall("tests/file.txt"),
+          assistantText("done"),
+          readCall("tests/file.txt"),
+          assistantText("done again"),
+        ],
+      });
+      await harness.session.prompt("read the file");
+      expect(sectionOf(harness.faux.requests[1])).toContain("original winner");
+      project.write(
+        ".pi/pi-agents-autoload.json",
+        JSON.stringify({ ignore: ["tests/AGENTS.override.md"] }),
+      );
+      await harness.session.reload();
+      await harness.session.prompt("read it again");
+      expect(sectionOf(harness.faux.requests[3])).toContain("fallback winner");
+      expect(sectionOf(harness.faux.requests[3])).not.toContain("original winner");
+    } finally {
+      harness?.cleanup();
+      project.cleanup();
+    }
+  });
+
   it("stops managing instructions that match a new ignore pattern after a reload", {
     timeout: 30000,
   }, async () => {
@@ -641,7 +677,7 @@ describe("ignore configuration", () => {
       expect(sectionOf(harness.faux.requests[2])).toBe("");
       notifications.length = 0;
       await harness.session.prompt("/agents-md-status");
-      expect(notifications[0]).toContain("No AGENTS.md files loaded.");
+      expect(notifications[0]).toContain("No instruction files loaded.");
       expect(notifications[0]).toContain("Ignore patterns: 1");
     } finally {
       harness?.cleanup();

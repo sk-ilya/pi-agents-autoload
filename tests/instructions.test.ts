@@ -73,7 +73,7 @@ describe("formatStatus", () => {
       carryOver: [selected],
     });
     const lines = text.split("\n");
-    expect(lines[0]).toBe("AGENTS.md: faux/faux-1");
+    expect(lines[0]).toBe("Instructions: faux/faux-1");
     expect(lines[1]).toBe("Mid-convo system: yes | Mode: auto (project) → immediate");
     expect(lines[2]).toBe("Carry-over: 4+ hits | 50 KiB total | files unlimited");
     expect(lines).toContain("Pi-loaded (1 file | ~100 tokens)");
@@ -114,9 +114,9 @@ describe("formatStatus", () => {
 
   it("handles the empty case concisely", () => {
     const text = formatStatus({ ...base, nativeFiles: [], nestedFiles: [] });
-    expect(text).toContain("AGENTS.md: faux/faux-1");
+    expect(text).toContain("Instructions: faux/faux-1");
     expect(text).toContain("Mid-convo system: yes | Mode: auto (project) → immediate");
-    expect(text).toContain("No AGENTS.md files loaded.");
+    expect(text).toContain("No instruction files loaded.");
   });
 });
 
@@ -202,6 +202,21 @@ describe("carry-over selection", () => {
     expect(selectCarryOver(files, hits, { maxBytes: 0, maxFiles: 1 })).toEqual([other]);
     hits.set(parent.key, 3);
     expect(selectCarryOver(files, hits, { maxBytes: 0, maxFiles: 0 })).toEqual([other]);
+  });
+
+  it("keeps a differently named managed parent with its child", () => {
+    const parent = file("tests/CLAUDE.md", "parent");
+    const child = file("tests/sub/AGENTS.override.md", "child");
+    const hits = new Map([
+      [parent.key, 4],
+      [child.key, 5],
+    ]);
+    expect(selectCarryOver([child, parent], hits, { maxBytes: 11, maxFiles: 2 })).toEqual([
+      parent,
+      child,
+    ]);
+    hits.set(parent.key, 3);
+    expect(selectCarryOver([child, parent], hits, { maxBytes: 0, maxFiles: 0 })).toEqual([]);
   });
 
   it("breaks ties by shallowest then alphabetical path", () => {
@@ -518,6 +533,52 @@ describe("instruction lifecycle", () => {
     }
   });
 
+  it("restores a CLAUDE.md winner and refreshes it when an override appears", {
+    timeout: 30000,
+  }, async () => {
+    const project = makeProject();
+    const sessionDir = mkdtempSync(join(tmpdir(), "pi-agents-autoload-sessions-"));
+    let first: Awaited<ReturnType<typeof createHarness>> | undefined;
+    let resumed: Awaited<ReturnType<typeof createHarness>> | undefined;
+    try {
+      project.write("tests/CLAUDE.md", "saved claude");
+      project.write("tests/file.txt", "x");
+      first = await createHarness({
+        cwd: project.dir,
+        sessionDir,
+        model: fauxModel({ supportsMidConvoSystemMessages: true }),
+        responses: [readCall("tests/file.txt"), assistantText("done")],
+      });
+      const sessionFile = first.sessionFile;
+      await first.session.prompt("read the file");
+      first.cleanup();
+      first = undefined;
+
+      resumed = await createHarness({
+        cwd: project.dir,
+        sessionDir,
+        sessionFile,
+        sessionStartEvent: { type: "session_start", reason: "resume" },
+        model: fauxModel({ supportsMidConvoSystemMessages: true }),
+        responses: [assistantText("continued"), readCall("tests/file.txt"), assistantText("done")],
+      });
+      await resumed.session.prompt("continue");
+      expect(sectionOf(resumed.faux.requests[0])).toContain("saved claude");
+      project.write("tests/AGENTS.override.md", "new override");
+      await resumed.session.prompt("read it again");
+      expect(sectionOf(resumed.faux.requests[2])).toContain("new override");
+      expect(sectionOf(resumed.faux.requests[2])).not.toContain("saved claude");
+      expect(lastSnapshotData(resumed.sessionManager)?.files.map((file) => file.path)).toEqual([
+        "tests/AGENTS.override.md",
+      ]);
+    } finally {
+      first?.cleanup();
+      resumed?.cleanup();
+      project.cleanup();
+      rmSync(sessionDir, { recursive: true, force: true });
+    }
+  });
+
   it("restores hit counts across resume before compaction", { timeout: 30000 }, async () => {
     const project = makeProject();
     const sessionDir = mkdtempSync(join(tmpdir(), "pi-agents-autoload-sessions-"));
@@ -666,6 +727,41 @@ describe("instruction lifecycle", () => {
       await harness.session.prompt("sit idle");
       expect(sectionOf(harness.faux.requests[6])).not.toContain(NESTED_MARKER);
       expect(lastSnapshotData(harness.sessionManager)?.files).toEqual([]);
+    } finally {
+      harness?.cleanup();
+      project.cleanup();
+    }
+  });
+
+  it("retains differently named parent and child winners through compaction", {
+    timeout: 30000,
+  }, async () => {
+    const project = makeProject();
+    let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+    try {
+      project.write("tests/CLAUDE.md", "parent claude");
+      project.write("tests/sub/AGENTS.override.md", "child override");
+      project.write("tests/sub/file.txt", "x");
+      harness = await createHarness({
+        cwd: project.dir,
+        model: fauxModel({ supportsMidConvoSystemMessages: true }),
+        withCompactionHelper: true,
+        settings: { compaction: { keepRecentTokens: 1 } },
+        responses: [
+          readRepeatedCall("tests/sub/file.txt", 4),
+          assistantText("done"),
+          assistantText("continued"),
+        ],
+      });
+      await harness.session.prompt("read the file");
+      await harness.session.compact();
+      expect(lastSnapshotData(harness.sessionManager)?.files.map((file) => file.path)).toEqual([
+        "tests/CLAUDE.md",
+        "tests/sub/AGENTS.override.md",
+      ]);
+      await harness.session.prompt("continue");
+      expect(sectionOf(harness.faux.requests[2])).toContain("parent claude");
+      expect(sectionOf(harness.faux.requests[2])).toContain("child override");
     } finally {
       harness?.cleanup();
       project.cleanup();

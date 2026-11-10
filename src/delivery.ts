@@ -22,7 +22,7 @@ const BLOCK_CLOSE = "</project_instructions>";
 
 /** Block reason when another result or the system section carries the instructions. */
 export const REVIEW_BLOCK_REASON =
-  "Blocked: nested AGENTS.md instructions were discovered for this path. Review them in this " +
+  "Blocked: nested context-file instructions were discovered for this path. Review them in this " +
   "tool batch or the system prompt, then retry the same operation.";
 
 /** How the model receives a discovered file. */
@@ -56,7 +56,7 @@ export function renderDeferredText(
   files: ReadonlyArray<{ displayPath: string; content: string }>,
 ): string {
   return (
-    "Discovered nested AGENTS.md instructions. Each applies to its own directory and " +
+    "Discovered nested context-file instructions. Each applies to its own directory and " +
     `every directory beneath it, in addition to previously loaded project instructions:\n\n${renderInstructionBlocks(files)}`
   );
 }
@@ -66,7 +66,7 @@ export function renderBlockReason(
   files: ReadonlyArray<{ displayPath: string; content: string }>,
 ): string {
   return (
-    "Blocked: nested AGENTS.md instructions were discovered for this path. Review them, " +
+    "Blocked: nested context-file instructions were discovered for this path. Review them, " +
     "then retry the same operation. They apply in addition to previously loaded project " +
     `instructions:\n\n${renderInstructionBlocks(files)}`
   );

@@ -52,7 +52,7 @@ function errorMessage(error: unknown): string {
 
 /**
  * Match a normalized, project-relative instruction path (for example
- * `vendor/lib/AGENTS.md`) against ignore patterns. Patterns use Node's
+ * `vendor/lib/CLAUDE.md`) against ignore patterns. Patterns use Node's
  * `path.matchesGlob`, which treats unparseable globs as non-matching.
  */
 export function isIgnoredPath(displayPath: string, patterns: readonly string[]): boolean {
