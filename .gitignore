@@ -3,4 +3,5 @@ coverage/
 dist/
 *.tsbuildinfo
 .artifacts/
+/.pi/
 *.tgz
