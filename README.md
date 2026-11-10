@@ -50,7 +50,7 @@ If an edit or write encounters new or updated instructions, the operation is blo
 
 On each relevant access, the extension checks for instruction changes. Unchanged content produces no prompt update. System-delivered files have separate prompt sections, anchored after the discovering tool batch. Each subsequent request replays the same section changes at the same positions, so discovering another file leaves the cached prefix intact.
 
-**Retention:** Successful file accesses count hits for applicable discovered managed `AGENTS.md` files, including their managed parents; a complete direct read also counts the instruction file itself. Failed operations do not count. At compaction, files with at least two hits compete by hit count for a shared 80 KiB UTF-8 content budget. A child is skipped unless its applicable managed parent is also selected. Ties favor shallower paths, then alphabetical paths. Unselected system sections are omitted from subsequent model requests, even when Pi's compaction checkpoint retains them. Pi's recent tool-result tail, including any previously injected instructions, stays intact; those instructions can remain visible until a later compaction. Hits reset after compaction; subsequent accesses can rediscover dropped files. Pi-loaded root and ancestor instructions are unaffected and do not use the budget.
+**Retention:** Successful file accesses count hits for applicable discovered managed `AGENTS.md` files, including their managed parents; a complete direct read also counts the instruction file itself. Failed operations do not count. At compaction, files with at least four hits compete by hit count for a shared 50 KiB UTF-8 content budget. A child is skipped unless its applicable managed parent is also selected. Ties favor shallower paths, then alphabetical paths. Unselected system sections are omitted from subsequent model requests, even when Pi's compaction checkpoint retains them. Pi's recent tool-result tail, including any previously injected instructions, stays intact; those instructions can remain visible until a later compaction. Hits reset after compaction; subsequent accesses can rediscover dropped files. Pi-loaded root and ancestor instructions are unaffected and do not use the budget.
 
 ## Configuration
 
@@ -67,12 +67,12 @@ Example:
 {
   "mode": "auto",
   "ignore": ["vendor/**", "**/generated/**", "docs/legacy/AGENTS.md"],
-  "maxBytes": 81920,
+  "maxBytes": 51200,
   "maxFiles": 0
 }
 ```
 
-Each setting resolves independently: trusted project configuration overrides global configuration, which overrides the defaults (`mode: "auto"`, `ignore: []`, `maxBytes: 81920`, `maxFiles: 0`). `maxBytes` caps the combined UTF-8 content of selected managed files; `maxFiles` caps their count. Both accept non-negative safe integers, with `0` meaning unlimited. An empty project `ignore` array overrides the global list.
+Each setting resolves independently: trusted project configuration overrides global configuration, which overrides the defaults (`mode: "auto"`, `ignore: []`, `maxBytes: 51200`, `maxFiles: 0`). `maxBytes` caps the combined UTF-8 content of selected managed files; `maxFiles` caps their count. Both accept non-negative safe integers, with `0` meaning unlimited. An empty project `ignore` array overrides the global list.
 
 Invalid configuration is reported through Pi's extension errors, and the session falls back to defaults.
 

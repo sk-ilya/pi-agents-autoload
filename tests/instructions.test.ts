@@ -7,6 +7,7 @@ import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { DEFAULT_MAX_BYTES } from "../src/config";
 import { renderBlockReason, renderDeferredText } from "../src/delivery";
 import { type InstructionFile, selectCarryOver } from "../src/instructions";
 import { formatStatus } from "../src/status";
@@ -26,6 +27,7 @@ import {
   nativeSectionOf,
   notifyCapture,
   readCall,
+  readRepeatedCall,
   readTwiceCall,
   sectionOf,
   snapshotCount,
@@ -43,11 +45,11 @@ describe("formatStatus", () => {
     cwd: "/proj",
     home: "/home/u",
     hits: new Map([
-      ["a", 2],
+      ["a", 4],
       ["b", 1],
     ]),
     carryOver: [],
-    maxBytes: 80 * 1024,
+    maxBytes: 50 * 1024,
     maxFiles: 0,
   };
 
@@ -73,7 +75,7 @@ describe("formatStatus", () => {
     const lines = text.split("\n");
     expect(lines[0]).toBe("AGENTS.md: faux/faux-1");
     expect(lines[1]).toBe("Mid-convo system: yes | Mode: auto (project) → immediate");
-    expect(lines[2]).toBe("Carry-over: 2+ hits | 80 KiB total | files unlimited");
+    expect(lines[2]).toBe("Carry-over: 4+ hits | 50 KiB total | files unlimited");
     expect(lines).toContain("Pi-loaded (1 file | ~100 tokens)");
     expect(lines).toContain("Managed (2 files | ~120 tokens | 480 B)");
     expect(lines).toContain("If compacted now:");
@@ -82,7 +84,7 @@ describe("formatStatus", () => {
     const rows = lines.filter((line) => line.startsWith("  - "));
     expect(rows).toHaveLength(3);
     expect(rows[0]).toMatch(/^ {2}- AGENTS\.md +\(~100 tokens\)$/);
-    expect(rows[1]).toMatch(/^ {2}- tests\/AGENTS\.md +\(~100 tokens · 2 hits\)$/);
+    expect(rows[1]).toMatch(/^ {2}- tests\/AGENTS\.md +\(~100 tokens · 4 hits\)$/);
     expect(rows[2]).toMatch(/^ {2}- docs\/AGENTS\.md +\(~20 tokens · 1 hit\)$/);
     expect(rows.map((line) => line.indexOf("("))).toEqual(Array(3).fill(rows[0].indexOf("(")));
     expect(text).toContain("3 files | ~220 tokens");
@@ -156,7 +158,7 @@ describe("carry-over selection", () => {
       file("tests/c/AGENTS.md", "c".repeat(4)),
       file("tests/d/AGENTS.md", "d"),
     ];
-    const hits = new Map(files.map((entry, index) => [entry.key, [3, 4, 2, 1][index]]));
+    const hits = new Map(files.map((entry, index) => [entry.key, [5, 6, 4, 3][index]]));
     expect(
       selectCarryOver(files, hits, { maxBytes: 8, maxFiles: 0 }).map((entry) => entry.displayPath),
     ).toEqual(["tests/b/AGENTS.md", "tests/c/AGENTS.md"]);
@@ -169,6 +171,22 @@ describe("carry-over selection", () => {
     ]);
   });
 
+  it("requires four hits and caps the default selection at 50 KiB", () => {
+    const below = file("tests/low/AGENTS.md", "low");
+    const full = file("tests/full/AGENTS.md", "x".repeat(50 * 1024));
+    const excess = file("tests/excess/AGENTS.md", "y");
+    const hits = new Map([
+      [below.key, 3],
+      [full.key, 5],
+      [excess.key, 4],
+    ]);
+    const limits = { maxBytes: DEFAULT_MAX_BYTES, maxFiles: 0 };
+    expect(selectCarryOver([below], hits, limits)).toEqual([]);
+    hits.set(below.key, 4);
+    expect(selectCarryOver([below], hits, limits)).toEqual([below]);
+    expect(selectCarryOver([below, full, excess], hits, limits)).toEqual([full]);
+  });
+
   it("includes qualifying managed parents before a child or skips the child", () => {
     const parent = file("tests/AGENTS.md", "parent");
     const child = file("tests/sub/AGENTS.md", "child");
@@ -176,19 +194,19 @@ describe("carry-over selection", () => {
     const files = [child, other, parent];
     const hits = new Map([
       [child.key, 5],
-      [parent.key, 2],
-      [other.key, 3],
+      [parent.key, 4],
+      [other.key, 4],
     ]);
     expect(selectCarryOver(files, hits, { maxBytes: 11, maxFiles: 0 })).toEqual([parent, child]);
     expect(selectCarryOver(files, hits, { maxBytes: 6, maxFiles: 0 })).toEqual([other]);
     expect(selectCarryOver(files, hits, { maxBytes: 0, maxFiles: 1 })).toEqual([other]);
-    hits.set(parent.key, 1);
+    hits.set(parent.key, 3);
     expect(selectCarryOver(files, hits, { maxBytes: 0, maxFiles: 0 })).toEqual([other]);
   });
 
   it("breaks ties by shallowest then alphabetical path", () => {
     const files = [file("z/AGENTS.md", "z"), file("a/b/AGENTS.md", "b"), file("a/AGENTS.md", "a")];
-    const hits = new Map(files.map((entry) => [entry.key, 2]));
+    const hits = new Map(files.map((entry) => [entry.key, 4]));
     expect(
       selectCarryOver(files, hits, { maxBytes: 0, maxFiles: 0 }).map((entry) => entry.displayPath),
     ).toEqual(["a/AGENTS.md", "z/AGENTS.md", "a/b/AGENTS.md"]);
@@ -291,7 +309,7 @@ describe("instruction lifecycle", () => {
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
         responses: [
-          readTwiceCall("tests/a/file.txt"),
+          readRepeatedCall("tests/a/file.txt", 4),
           assistantText("done"),
           readCall("tests/b/file.txt"),
           assistantText("done again"),
@@ -304,9 +322,9 @@ describe("instruction lifecycle", () => {
       await harness.session.prompt("read b");
       await harness.session.prompt("ready");
       await harness.session.prompt("/agents-md-status");
-      expect(notifications.at(-1)).toContain("Carry-over: 2+ hits | 20 B total");
+      expect(notifications.at(-1)).toContain("Carry-over: 4+ hits | 20 B total");
       expect(notifications.at(-1)).toContain("If compacted now: 1 of 2 managed");
-      expect(notifications.at(-1)).toContain("2 hits");
+      expect(notifications.at(-1)).toContain("4 hits");
       expect(notifications.at(-1)).toContain("1 hit");
 
       await harness.session.compact();
@@ -411,13 +429,13 @@ describe("instruction lifecycle", () => {
         responses: [
           readCall("intro.txt"),
           assistantText("done"),
-          readTwiceCall("tests/file.txt"),
+          readRepeatedCall("tests/file.txt", 4),
           assistantText("done"),
           assistantText("continued"),
         ],
       });
       await harness.session.prompt("read intro");
-      await harness.session.prompt("read nested twice");
+      await harness.session.prompt("read nested four times");
       await harness.session.compact();
       await harness.session.prompt("continue");
       const request = harness.faux.requests[4];
@@ -426,7 +444,7 @@ describe("instruction lifecycle", () => {
         results.filter((message) =>
           JSON.stringify(message.content).includes("original read payload"),
         ),
-      ).toHaveLength(2);
+      ).toHaveLength(4);
       expect(JSON.stringify(results)).toContain("selected nested instructions");
       expect(sectionOf(request)).toContain("selected nested instructions");
     } finally {
@@ -512,10 +530,10 @@ describe("instruction lifecycle", () => {
         cwd: project.dir,
         sessionDir,
         model: fauxModel({ supportsMidConvoSystemMessages: true }),
-        responses: [readTwiceCall("tests/file.txt"), assistantText("done")],
+        responses: [readRepeatedCall("tests/file.txt", 4), assistantText("done")],
       });
       const sessionFile = first.sessionFile;
-      await first.session.prompt("read twice");
+      await first.session.prompt("read four times");
       expect(snapshotCount(first.sessionManager)).toBe(1);
       first.cleanup();
       first = undefined;
@@ -533,7 +551,7 @@ describe("instruction lifecycle", () => {
         uiContext,
       });
       await second.session.prompt("/agents-md-status");
-      expect(notifications[0]).toContain("2 hits");
+      expect(notifications[0]).toContain("4 hits");
       expect(notifications[0]).toContain("If compacted now: 1 of 1 managed");
       await second.session.compact();
       await second.session.prompt("continue");
@@ -594,7 +612,7 @@ describe("instruction lifecycle", () => {
         // does not re-trigger after the run ends.
         settings: { compaction: { reserveTokens: 128000 - 500, keepRecentTokens: 1 } },
         responses: [
-          readTwiceCall("tests/file.txt"),
+          readRepeatedCall("tests/file.txt", 4),
           assistantText("done"),
           assistantText("continued"),
           readCall("tests/small.txt"),
@@ -669,7 +687,7 @@ describe("instruction lifecycle", () => {
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
         responses: [
-          readTwiceCall("tests/file.txt"),
+          readRepeatedCall("tests/file.txt", 4),
           assistantText("done"),
           assistantText("continued"),
           assistantText("continued again"),
@@ -743,7 +761,7 @@ describe("instruction lifecycle", () => {
         withCompactionHelper: true,
         settings: { compaction: { reserveTokens: 128000 - 500, keepRecentTokens: 1 } },
         responses: [
-          readCall("tests/file.txt"),
+          readRepeatedCall("tests/file.txt", 3),
           assistantText("done"),
           assistantText("continued"),
           readCall("tests/big.txt"),
@@ -801,11 +819,11 @@ describe("instruction lifecycle", () => {
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
         responses: [
-          readTwiceCall("tests/a.txt"),
+          readRepeatedCall("tests/a.txt", 4),
           assistantText("done"),
-          readTwiceCall("tests/b.txt"),
+          readRepeatedCall("tests/b.txt", 4),
           assistantText("done again"),
-          readTwiceCall("tests/a.txt"),
+          readRepeatedCall("tests/a.txt", 4),
           assistantText("done once more"),
         ],
         uiContext,
@@ -853,12 +871,12 @@ describe("instruction lifecycle", () => {
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
         responses: [
-          readTwiceCall("tests/integration/file.txt"),
+          readRepeatedCall("tests/integration/file.txt", 4),
           assistantText("done"),
-          readTwiceCall("osac-operator/file.txt"),
+          readRepeatedCall("osac-operator/file.txt", 4),
           assistantText("done again"),
           assistantText("idle"),
-          readTwiceCall("tests/integration/file.txt"),
+          readRepeatedCall("tests/integration/file.txt", 4),
           assistantText("done once more"),
           assistantText("idle again"),
         ],
@@ -910,10 +928,12 @@ describe("instruction lifecycle", () => {
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
         responses: [
-          readTwiceCall("tests/a.txt"),
+          readRepeatedCall("tests/a.txt", 4),
           assistantText("done"),
           assistantToolCalls([
             { name: "edit", args: editArgs },
+            { name: "read", args: { path: "tests/a.txt" } },
+            { name: "read", args: { path: "tests/a.txt" } },
             { name: "read", args: { path: "tests/a.txt" } },
           ]),
           assistantText("edited"),
@@ -960,7 +980,7 @@ describe("instruction lifecycle", () => {
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
         responses: [
-          readTwiceCall("tests/a.txt"),
+          readRepeatedCall("tests/a.txt", 4),
           assistantText("done"),
           assistantToolCalls([{ name: "edit", args: editArgs }]),
           assistantToolCalls([{ name: "edit", args: editArgs }]),
@@ -1004,7 +1024,7 @@ describe("instruction lifecycle", () => {
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
         responses: [
-          readTwiceCall("tests/file.txt"),
+          readRepeatedCall("tests/file.txt", 4),
           assistantText("done"),
           readCall("tests/missing.txt"),
           assistantText("missing"),
@@ -1039,7 +1059,11 @@ describe("instruction lifecycle", () => {
         model: fauxModel({ supportsMidConvoSystemMessages: true }),
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
-        responses: [readTwiceCall("tests/file.txt"), assistantText("done"), assistantText("idle")],
+        responses: [
+          readRepeatedCall("tests/file.txt", 4),
+          assistantText("done"),
+          assistantText("idle"),
+        ],
       });
       await harness.session.prompt("read the file");
 
@@ -1074,7 +1098,7 @@ describe("instruction lifecycle", () => {
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
         responses: [
-          readTwiceCall("tests/a.txt"),
+          readRepeatedCall("tests/a.txt", 4),
           assistantText("done"),
           assistantToolCalls([
             { name: "read", args: { path: "tests/a.txt" } },
@@ -1117,7 +1141,7 @@ describe("instruction lifecycle", () => {
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
         responses: [
-          readTwiceCall("tests/file.txt"),
+          readRepeatedCall("tests/file.txt", 4),
           assistantText("done"),
           assistantText("continued"),
           assistantText("idle"),
@@ -1159,8 +1183,8 @@ describe("instruction lifecycle", () => {
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
         responses: [
-          readCall("tests/a/file.txt"),
-          readCall("tests/b/file.txt"),
+          readRepeatedCall("tests/a/file.txt", 4),
+          readRepeatedCall("tests/b/file.txt", 4),
           assistantText("done"),
           assistantText("idle"),
           readCall("tests/b/file.txt"),
@@ -1372,7 +1396,7 @@ describe("instruction lifecycle", () => {
         model: fauxModel({ supportsMidConvoSystemMessages: true }),
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
-        responses: [readTwiceCall("tests/file.txt"), assistantText("done")],
+        responses: [readRepeatedCall("tests/file.txt", 4), assistantText("done")],
       });
       const sessionFile = first.sessionFile;
       await first.session.prompt("read the file");
@@ -1424,9 +1448,9 @@ describe("instruction lifecycle", () => {
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
         responses: [
-          readTwiceCall("tests/a/file.txt"),
+          readRepeatedCall("tests/a/file.txt", 4),
           assistantText("done"),
-          readTwiceCall("tests/b/file.txt"),
+          readRepeatedCall("tests/b/file.txt", 4),
           assistantText("done again"),
         ],
       });
@@ -1478,7 +1502,7 @@ describe("instruction lifecycle", () => {
         model: fauxModel({ supportsMidConvoSystemMessages: true }),
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
-        responses: [readTwiceCall("tests/file.txt"), assistantText("done")],
+        responses: [readRepeatedCall("tests/file.txt", 4), assistantText("done")],
       });
       const sessionFile = first.sessionFile;
       await first.session.prompt("read the file");
@@ -1532,7 +1556,11 @@ describe("instruction lifecycle", () => {
         model: fauxModel({ supportsMidConvoSystemMessages: true }),
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
-        responses: [readTwiceCall("tests/file.txt"), assistantText("done"), assistantText("idle")],
+        responses: [
+          readRepeatedCall("tests/file.txt", 4),
+          assistantText("done"),
+          assistantText("idle"),
+        ],
       });
       await harness.session.prompt("read the file");
       const leafAfterDiscovery = harness.sessionManager.getLeafId();
@@ -1541,7 +1569,7 @@ describe("instruction lifecycle", () => {
       // The compaction retains the file and resets its hits.
       await harness.session.compact();
 
-      // Navigating back to discovery restores two hits on that branch.
+      // Navigating back to discovery restores four hits on that branch.
       await harness.session.navigateTree(leafAfterDiscovery, { summarize: false });
       await harness.session.compact();
       await harness.session.prompt("sit idle");

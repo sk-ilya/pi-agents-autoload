@@ -17,7 +17,7 @@ import {
 export const ENTRY_TYPE = "pi-agents-autoload";
 export const HITS_ENTRY_TYPE = "pi-agents-autoload-hits";
 export const PATCH_ENTRY_TYPE = "pi-agents-autoload-sections";
-export const MIN_HITS = 2;
+export const MIN_HITS = 4;
 
 export interface SectionPatch {
   afterId: string;

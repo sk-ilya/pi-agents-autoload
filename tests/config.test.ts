@@ -74,7 +74,7 @@ describe("configuration", () => {
         uiContext,
       });
       await harness.session.prompt("/agents-md-status");
-      expect(notifications[0]).toContain("Carry-over: 2+ hits | 1 KiB total | up to 2 files");
+      expect(notifications[0]).toContain("Carry-over: 4+ hits | 1 KiB total | up to 2 files");
     } finally {
       harness?.cleanup();
       project.cleanup();
@@ -95,6 +95,7 @@ describe("configuration", () => {
       await harness.session.prompt("/agents-md-status");
       expect(harness.faux.requests).toHaveLength(0);
       expect(notifications[0]).toContain("Mode: auto (default) → immediate");
+      expect(notifications[0]).toContain("Carry-over: 4+ hits | 50 KiB total | files unlimited");
     } finally {
       harness?.cleanup();
       project.cleanup();

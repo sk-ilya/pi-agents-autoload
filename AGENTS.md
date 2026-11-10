@@ -13,8 +13,8 @@ scripted model.
   `@earendil-works/pi-ai`); do not import private Pi internals.
 - Try changes without installing: `pi -e ./src/index.ts`. Disable any installed
   copy first to avoid loading the extension twice.
-- Compaction retains managed files with at least two successful access hits
-  during the cycle, ranked within a shared 80 KiB default UTF-8 content budget;
+- Compaction retains managed files with at least four successful access hits
+  during the cycle, ranked within a shared 50 KiB default UTF-8 content budget;
   applicable managed parents must fit too. Selected files receive per-file
   system sections anchored after the compaction summary; unselected sections
   are omitted while Pi's recent tool-result history remains intact. Pi-native

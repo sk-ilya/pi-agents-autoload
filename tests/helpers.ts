@@ -100,11 +100,14 @@ export function readCall(path: string) {
   return assistantToolCalls([{ name: "read", args: { path } }]);
 }
 
+export function readRepeatedCall(path: string, count: number) {
+  return assistantToolCalls(
+    Array.from({ length: count }, () => ({ name: "read", args: { path } })),
+  );
+}
+
 export function readTwiceCall(path: string) {
-  return assistantToolCalls([
-    { name: "read", args: { path } },
-    { name: "read", args: { path } },
-  ]);
+  return readRepeatedCall(path, 2);
 }
 
 export function writeFixture(project: Project): void {

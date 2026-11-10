@@ -15,7 +15,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 
 export const CONFIG_FILE_NAME = "pi-agents-autoload.json";
-export const DEFAULT_MAX_BYTES = 80 * 1024;
+export const DEFAULT_MAX_BYTES = 50 * 1024;
 
 export type Mode = "auto" | "immediate" | "deferred";
 
