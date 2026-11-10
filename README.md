@@ -2,7 +2,16 @@
 
 Progressive `AGENTS.md` discovery and loading for [Pi](https://github.com/badlogic/pi-mono).
 
-Pi normally loads instructions from the working directory and its ancestors at startup. This extension automatically discovers nested `AGENTS.md` files as the agent works, loading relevant instructions on demand instead of including every directory's instructions in the initial context.
+Pi loads instructions from the working directory and its ancestors at startup. This extension discovers nested `AGENTS.md` files as the agent works, loading only relevant instructions instead of including them all in the initial context.
+
+## Features
+
+- **Safe edits and writes** - Ensures applicable instructions reach the agent before file modifications, including parallel tool calls.
+- **Model-aware delivery** - Uses system-prompt updates where supported, with a cache-friendly tool-result fallback.
+- **Compaction-aware retention** - Preserves recently used instructions across compaction and expires inactive ones.
+- **Automatic refresh** - Detects changed or deleted instructions on subsequent file accesses without redundant prompt updates.
+- **Session persistence** - Restores instructions across session resumption and branch navigation.
+- **Configurable exclusions** - Supports glob patterns to exclude selected instructions from automatic loading.
 
 ## Installation
 
@@ -33,63 +42,81 @@ project/
     └── app.test.ts
 ```
 
-When Pi reads `src/app.ts`, the extension discovers `src/AGENTS.md` and adds its instructions to the context. Accessing `tests/app.test.ts` loads `tests/AGENTS.md` separately.
+Reading `src/app.ts` loads `src/AGENTS.md`. Accessing `tests/app.test.ts` loads its instructions separately. Applicable instructions are loaded from parent to child, without duplicates.
 
-If Pi attempts to edit or write a file before receiving its applicable instructions, the operation is blocked so the agent can retry with them loaded.
+If an edit or write encounters new or updated instructions, the operation is blocked until the agent receives them and can retry. If an applicable instruction file cannot be inspected, edits and writes stay blocked until access is restored. Reading an `AGENTS.md` file directly does not inject a second copy.
 
-Instructions are deduplicated and remain active across compaction. At each compaction, instructions used since the previous compaction are retained; those unused for a full cycle expire. Accessing files in their directories renews them.
+On each relevant access, the extension checks for instruction changes. Unchanged content produces no prompt update.
+
+**Retention:** At each successful compaction, instructions used during the current cycle are retained and their usage is reset. Instructions unused throughout the following cycle expire at the next compaction. Accessing their directories again renews or rediscovers them.
 
 ## Configuration
 
-Configuration is optional. Create `pi-agents-autoload.json` in either location:
+Configuration is optional:
 
 | Scope   | Path                                  |
 | ------- | ------------------------------------- |
 | Global  | `~/.pi/agent/pi-agents-autoload.json` |
 | Project | `.pi/pi-agents-autoload.json`         |
 
-Project settings override global settings and require a trusted project. The default mode is `auto`.
+Example:
 
 ```json
 {
-  "mode": "auto"
+  "mode": "auto",
+  "ignore": ["vendor/**", "**/generated/**", "docs/legacy/AGENTS.md"]
 }
 ```
 
-| Mode        | Behavior                                                                                                        |
-| ----------- | --------------------------------------------------------------------------------------------------------------- |
-| `auto`      | Use system-prompt updates when the model supports mid-conversation system messages; otherwise use tool results. |
-| `immediate` | Always update the system prompt, potentially invalidating the prompt cache.                                     |
-| `deferred`  | Initially append instructions to tool results, preserving the cached prompt prefix.                             |
+Each setting resolves independently: trusted project configuration overrides global configuration, which overrides the defaults (`mode: "auto"`, `ignore: []`). An empty project `ignore` array overrides the global list.
 
-Instructions initially delivered through tool results are promoted to the system prompt when retained across compaction.
+Invalid configuration is reported through Pi's extension errors, and the session falls back to defaults.
+
+### Delivery modes
+
+| Mode        | Behavior                                                                                                               |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `auto`      | Use system-prompt updates when the model supports mid-conversation system messages; otherwise use tool results.        |
+| `immediate` | Force system-prompt delivery. May cause prompt cache misses on models without mid-conversation system-message support. |
+| `deferred`  | Initially deliver instructions through tool results, preserving the cached prompt prefix.                              |
+
+Instructions delivered through tool results are promoted to the system prompt when retained across compaction.
+
+### Ignore patterns
+
+`ignore` accepts glob patterns matched against project-relative `AGENTS.md` paths, using Node's `path.matchesGlob()`.
+
+Ignored instructions are not automatically loaded and do not block edits or writes. They can still be read explicitly. Ignoring a parent `AGENTS.md` does not exclude nested instruction files.
+
+Configuration reloads also remove newly ignored instructions from the active state. Root and ancestor instructions loaded natively by Pi are unaffected.
 
 ## Status
 
-Pi displays a notification when new instructions are loaded:
+New or updated instructions produce a notification:
 
 ```text
 AGENTS.md loaded (~120 tokens):
   src/AGENTS.md
 ```
 
-Use `/agents-md-status` to view all active instruction files, their delivery methods, approximate token counts, and the current model's loading mode.
+Use `/agents-md-status` to inspect active instruction files, delivery methods, approximate token counts, and the effective loading mode.
 
 ## Limitations
 
-- Detects file access through Pi's built-in `read`, `edit`, and `write` tools, not shell commands, MCP, or custom tools.
-- Only loads nested `AGENTS.md` files within the working directory. Symlinks to instruction files outside it are ignored.
-- Instruction changes are picked up on first re-access after compaction, not continuously monitored.
-- Expired instructions may still be referenced in retained conversation messages or compaction summaries.
+- Discovery operates through Pi's built-in `read`, `edit`, and `write` tools, not shell commands, MCP, or custom tools.
+- Only nested instructions within the working directory are managed. Symlinks pointing outside it are ignored.
+- Changes are detected on relevant file accesses, not continuously. Metadata-based checks may miss a same-size rewrite if file timestamps do not change.
+- Expired or deleted instructions may still appear in retained conversation history or compaction summaries.
 
 ## Development
 
-Requires Node.js 22.19 or newer.
+Requires Node.js 22.20 or newer.
 
 ```sh
 npm ci
 npm run check
-pi -e ./index.ts
+pi -e ./src/index.ts
 ```
+
 
 MIT licensed.

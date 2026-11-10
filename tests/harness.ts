@@ -42,10 +42,11 @@ const FAUX_API = "anthropic-messages" as const;
 const FAUX_PROVIDER = "faux";
 const FAUX_MODEL_ID = "faux-1";
 
-export const EXTENSION_PATH = fileURLToPath(new URL("../index.ts", import.meta.url));
+export const EXTENSION_PATH = fileURLToPath(new URL("../src/index.ts", import.meta.url));
 export const COMPACTION_HELPER_PATH = fileURLToPath(
   new URL("./compaction-helper.ts", import.meta.url),
 );
+const READ_RACE_HELPER_PATH = fileURLToPath(new URL("./read-race-helper.ts", import.meta.url));
 
 /** The faux model is API-generic; the harness never inspects the API type. */
 type AnyModel =
@@ -135,7 +136,8 @@ export function createScriptedStream(responses: ResponseStep[]): {
   const state: FauxStreamState = { requests: [] };
   const streamFn = (_model: AnyModel, context: TranscriptContext) => {
     state.requests.push(context);
-    const message = responses[Math.min(state.requests.length - 1, responses.length - 1)];
+    const message = responses[state.requests.length - 1];
+    if (!message) throw new Error(`Unexpected model request ${state.requests.length}`);
     const stream = createAssistantMessageEventStream();
     queueMicrotask(() => {
       const reason = (message.stopReason ?? "stop") as "stop" | "toolUse" | "length" | "deferred";
@@ -146,13 +148,16 @@ export function createScriptedStream(responses: ResponseStep[]): {
   return { streamFn, state };
 }
 
-/** Load the extension under test (and optionally the canned-compaction helper). */
+/** Load the extension under test and any test-only helpers in hook order. */
 export async function loadTestExtensions(options: {
   cwd: string;
   agentDir: string;
   withCompactionHelper?: boolean;
+  withReadRaceHelper?: boolean;
 }): Promise<LoadExtensionsResult> {
-  const paths = [EXTENSION_PATH];
+  const paths = options.withReadRaceHelper
+    ? [READ_RACE_HELPER_PATH, EXTENSION_PATH]
+    : [EXTENSION_PATH];
   if (options.withCompactionHelper) paths.push(COMPACTION_HELPER_PATH);
   const result = await discoverAndLoadExtensions(paths, options.cwd, options.agentDir);
   if (result.errors.length > 0) {
@@ -166,6 +171,7 @@ export function createHarnessResourceLoader(options: {
   cwd: string;
   agentDir: string;
   withCompactionHelper?: boolean;
+  withReadRaceHelper?: boolean;
   extensions: LoadExtensionsResult;
 }): ResourceLoader {
   let extensions = options.extensions;
@@ -198,6 +204,8 @@ export interface HarnessOptions {
   settings?: Record<string, unknown>;
   /** Load the canned-compaction helper extension. */
   withCompactionHelper?: boolean;
+  /** Change AGENTS.md between Pi's read and the extension's result handler. */
+  withReadRaceHelper?: boolean;
   /** Use a file-backed session manager in this directory (for resume tests). */
   sessionDir?: string;
   /** Event emitted as the session starts (defaults to "startup"). */
@@ -250,11 +258,13 @@ export async function createHarness(options: HarnessOptions): Promise<Harness> {
     cwd: options.cwd,
     agentDir,
     withCompactionHelper: options.withCompactionHelper,
+    withReadRaceHelper: options.withReadRaceHelper,
   });
   const resourceLoader = createHarnessResourceLoader({
     cwd: options.cwd,
     agentDir,
     withCompactionHelper: options.withCompactionHelper,
+    withReadRaceHelper: options.withReadRaceHelper,
     extensions,
   });
 
