@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.3] - 2026-11-10
+
+### Added
+
+- Support nested `AGENTS.override.md`, `AGENTS.MD`, `CLAUDE.md`, and `CLAUDE.MD` files, selecting one instruction file per directory in Pi's filename order.
+
+### Changed
+
+- Switch to the next eligible file on relevant access when a selected file is removed or ignored, and select a newly available higher-priority file.
+- Apply direct-read handling, edit safety, session restoration, and compaction parent selection to every supported filename.
+
 ## [0.1.2] - 2026-11-10
 
 ### Changed
