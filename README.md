@@ -118,5 +118,12 @@ npm run check
 pi -e ./src/index.ts
 ```
 
+If the npm package is also configured, remove or disable it first; `-e` would load a second copy of the extension.
+
+To run these checks before each commit, enable the tracked Git hook once per clone:
+
+```sh
+git config --local core.hooksPath .githooks
+```
 
 MIT licensed.
