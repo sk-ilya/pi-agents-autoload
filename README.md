@@ -46,11 +46,13 @@ project/
 
 Reading `src/app.ts` loads `src/AGENTS.md`. Accessing `tests/app.test.ts` loads its instructions separately. Applicable instructions are loaded from parent to child, without duplicates.
 
-If an edit or write encounters new or updated instructions, the operation is blocked until the agent receives them and can retry. If an applicable instruction file cannot be inspected, edits and writes stay blocked until access is restored. Reading an `AGENTS.md` file directly does not inject a second copy.
+If an edit or write uncovers new or changed instructions, the agent sees them before it can retry. If an applicable instruction file cannot be read, the edit or write remains blocked. Reading an `AGENTS.md` file directly does not load a second copy.
 
-On each relevant access, the extension checks for instruction changes. Unchanged content produces no prompt update. System-delivered files have separate prompt sections, anchored after the discovering tool batch. Each subsequent request replays the same section changes at the same positions, so discovering another file leaves the cached prefix intact.
+The extension checks for changes when a relevant file is accessed and leaves the prompt alone when instructions are unchanged. On supported models, new instructions appear after the access that found them, preserving the earlier conversation for prompt caching.
 
-**Retention:** Successful file accesses count hits for applicable discovered managed `AGENTS.md` files, including their managed parents; a complete direct read also counts the instruction file itself. Failed operations do not count. At compaction, files with at least four hits compete by hit count for a shared 50 KiB UTF-8 content budget. A child is skipped unless its applicable managed parent is also selected. Ties favor shallower paths, then alphabetical paths. Unselected system sections are omitted from subsequent model requests, even when Pi's compaction checkpoint retains them. Pi's recent tool-result tail, including any previously injected instructions, stays intact; those instructions can remain visible until a later compaction. Hits reset after compaction; subsequent accesses can rediscover dropped files. Pi-loaded root and ancestor instructions are unaffected and do not use the budget.
+**Retention:** Successful file accesses add hits to the instructions they use.
+
+At compaction, instructions with at least four hits may stay in the prompt. By default, the extension keeps the most-used files within a shared 50 KiB limit. Nested files must be kept with their managed parents; Pi's own startup instructions are outside the limit. Hits reset after compaction, and dropped files can be loaded again on a later access.
 
 ## Configuration
 
@@ -78,13 +80,11 @@ Invalid configuration is reported through Pi's extension errors, and the session
 
 ### Delivery modes
 
-| Mode        | Behavior                                                                                                                                |
-| ----------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `auto`      | Use system-prompt updates when the model supports mid-conversation system messages; otherwise use tool results.                         |
-| `immediate` | Force system-prompt delivery. Mid-run patches stay at a stable position; unsupported models may miss the cache when the prompt changes. |
-| `deferred`  | Initially deliver instructions through tool results, preserving the cached prompt prefix.                                               |
-
-Instructions delivered through tool results are promoted to the system prompt when retained across compaction. The extension persists section placement as session state and replays selected files at the compaction boundary; starting a new run does not move the patches. Earlier versions of changed instructions can remain in the append-only conversation until compaction.
+| Mode        | Behavior                                                                                       |
+| ----------- | ---------------------------------------------------------------------------------------------- |
+| `auto`      | Use system messages on supported models; otherwise use tool results.                           |
+| `immediate` | Always use system messages. Cache reuse may suffer on models without mid-conversation support. |
+| `deferred`  | Use tool results initially; retained instructions move to system messages after compaction.    |
 
 ### Ignore patterns
 
@@ -103,7 +103,7 @@ AGENTS.md loaded (~120 tokens):
   src/AGENTS.md
 ```
 
-Use `/agents-md-status` to inspect Pi-loaded and managed files, per-file hits, approximate token counts, measured managed bytes, and the effective loading mode. Managed files are grouped by which ones would receive system carry-over if compacted now; unselected files can still appear in Pi's recent tool-result history.
+Use `/agents-md-status` to see loaded files, hit counts, the current mode, and what would survive compaction.
 
 ## Limitations
 
