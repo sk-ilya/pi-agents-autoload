@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { parseMode } from "../src/config";
+import { parseMode, readConfigFile } from "../src/config";
 import {
   assistantText,
   assistantToolCalls,
@@ -35,6 +35,51 @@ describe("parseMode", () => {
 });
 
 describe("configuration", () => {
+  it("validates byte and file limits", async () => {
+    const project = makeProject();
+    try {
+      const file = project.path("limits.json");
+      for (const [name, value] of [
+        ["maxBytes", -1],
+        ["maxBytes", 1.5],
+        ["maxBytes", Number.MAX_SAFE_INTEGER + 1],
+        ["maxFiles", "2"],
+      ] as const) {
+        project.write("limits.json", JSON.stringify({ [name]: value }));
+        await expect(readConfigFile(file)).rejects.toThrow(
+          `"${name}" must be a non-negative integer`,
+        );
+      }
+      project.write("limits.json", JSON.stringify({ maxBytes: 0, maxFiles: 0 }));
+      await expect(readConfigFile(file)).resolves.toEqual({ maxBytes: 0, maxFiles: 0 });
+    } finally {
+      project.cleanup();
+    }
+  });
+
+  it("resolves limits per field from trusted project and global configuration", {
+    timeout: 30000,
+  }, async () => {
+    const project = makeProject();
+    let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+    try {
+      project.write(".pi/pi-agents-autoload.json", JSON.stringify({ maxBytes: 1024 }));
+      const { notifications, uiContext } = notifyCapture();
+      harness = await createHarness({
+        cwd: project.dir,
+        trusted: true,
+        model: fauxModel(),
+        globalConfig: JSON.stringify({ maxBytes: 2048, maxFiles: 2 }),
+        responses: [],
+        uiContext,
+      });
+      await harness.session.prompt("/agents-md-status");
+      expect(notifications[0]).toContain("Carry-over: 2+ hits | 1 KiB total | up to 2 files");
+    } finally {
+      harness?.cleanup();
+      project.cleanup();
+    }
+  });
   it("defaults to auto with no configuration", { timeout: 30000 }, async () => {
     const project = makeProject();
     let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
@@ -311,7 +356,7 @@ describe("configuration", () => {
       await harness.session.prompt("/agents-md-status");
       expect(notifications[0]).toContain("Mode: deferred (global) → deferred");
       // The previously loaded file keeps its delivery...
-      expect(notifications[0]).toMatch(/1 {2}tests\/AGENTS\.md \(System, /);
+      expect(notifications[0]).toMatch(/ {2}- tests\/AGENTS\.md +\(~\d+ tokens · 1 hit\)/);
 
       // ...and new discoveries use the reloaded mode.
       await harness.session.prompt("read the docs file");
@@ -367,8 +412,8 @@ describe("configuration", () => {
 
       await second.session.prompt("/agents-md-status");
       expect(notifications[0]).toContain("Mode: auto (default) → immediate");
-      expect(notifications[0]).toMatch(/tests\/AGENTS\.md \(Tool result, /);
-      expect(notifications[0]).toMatch(/docs\/AGENTS\.md \(System, /);
+      expect(notifications[0]).toMatch(/ {2}- tests\/AGENTS\.md +\(~\d+ tokens · 1 hit\)/);
+      expect(notifications[0]).toMatch(/ {2}- docs\/AGENTS\.md +\(~\d+ tokens · 1 hit\)/);
     } finally {
       first?.cleanup();
       second?.cleanup();

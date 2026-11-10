@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { renderBlockReason, renderDeferredText } from "../src/delivery";
+import { type InstructionFile, selectCarryOver } from "../src/instructions";
 import { formatStatus } from "../src/status";
 import {
   assistantText,
@@ -18,13 +19,14 @@ import {
 } from "./harness";
 import {
   DEFERRED_LEAD_IN,
+  lastHitCounts,
   lastMessage,
   lastSnapshotData,
   NESTED_MARKER,
   nativeSectionOf,
   notifyCapture,
-  persistedSectionPatches,
   readCall,
+  readTwiceCall,
   sectionOf,
   snapshotCount,
   toolResultTexts,
@@ -40,36 +42,72 @@ describe("formatStatus", () => {
     ignorePatterns: 0,
     cwd: "/proj",
     home: "/home/u",
+    hits: new Map([
+      ["a", 2],
+      ["b", 1],
+    ]),
+    carryOver: [],
+    maxBytes: 80 * 1024,
+    maxFiles: 0,
   };
 
-  it("lists native files first, then nested files in order, with delivery and token estimates", () => {
+  it("groups aligned native and managed files by carry-over outcome", () => {
+    const selected: InstructionFile = {
+      key: "a",
+      displayPath: "tests/AGENTS.md",
+      content: "x".repeat(400),
+      delivery: "system",
+    };
+    const dropped: InstructionFile = {
+      key: "b",
+      displayPath: "docs/AGENTS.md",
+      content: "z".repeat(80),
+      delivery: "toolResult",
+    };
     const text = formatStatus({
       ...base,
       nativeFiles: [{ path: "/proj/AGENTS.md", content: "y".repeat(400) }],
-      nestedFiles: [
-        {
-          key: "a",
-          displayPath: "tests/AGENTS.md",
-          content: "x".repeat(400),
-          delivery: "system",
-          usedSinceCompact: true,
-        },
-        {
-          key: "b",
-          displayPath: "docs/AGENTS.md",
-          content: "z".repeat(80),
-          delivery: "toolResult",
-          usedSinceCompact: false,
-        },
-      ],
+      nestedFiles: [dropped, selected],
+      carryOver: [selected],
     });
     const lines = text.split("\n");
     expect(lines[0]).toBe("AGENTS.md: faux/faux-1");
     expect(lines[1]).toBe("Mid-convo system: yes | Mode: auto (project) → immediate");
-    expect(lines[3]).toBe("1  AGENTS.md (Pi, ~100 tokens)");
-    expect(lines[4]).toBe("2  tests/AGENTS.md (System, ~100 tokens)");
-    expect(lines[5]).toBe("3  docs/AGENTS.md (Tool result, ~20 tokens)");
+    expect(lines[2]).toBe("Carry-over: 2+ hits | 80 KiB total | files unlimited");
+    expect(lines).toContain("Pi-loaded (1 file | ~100 tokens)");
+    expect(lines).toContain("Managed (2 files | ~120 tokens | 480 B)");
+    expect(lines).toContain("If compacted now:");
+    expect(lines).toContain("  Carry over");
+    expect(lines).toContain("  ---------- Not carried over ----------");
+    const rows = lines.filter((line) => line.startsWith("  - "));
+    expect(rows).toHaveLength(3);
+    expect(rows[0]).toMatch(/^ {2}- AGENTS\.md +\(~100 tokens\)$/);
+    expect(rows[1]).toMatch(/^ {2}- tests\/AGENTS\.md +\(~100 tokens · 2 hits\)$/);
+    expect(rows[2]).toMatch(/^ {2}- docs\/AGENTS\.md +\(~20 tokens · 1 hit\)$/);
+    expect(rows.map((line) => line.indexOf("("))).toEqual(Array(3).fill(rows[0].indexOf("(")));
     expect(text).toContain("3 files | ~220 tokens");
+    expect(text).toContain("If compacted now: 1 of 2 managed | ~100 tokens | 400 B");
+  });
+
+  it("omits empty outcome groups", () => {
+    const file: InstructionFile = {
+      key: "a",
+      displayPath: "tests/AGENTS.md",
+      content: "x",
+      delivery: "system",
+    };
+    const selected = formatStatus({
+      ...base,
+      nativeFiles: [],
+      nestedFiles: [file],
+      carryOver: [file],
+    });
+    expect(selected).toContain("  Carry over");
+    expect(selected).not.toContain("Not carried over");
+    expect(selected).not.toContain("Pi-loaded");
+    const dropped = formatStatus({ ...base, nativeFiles: [], nestedFiles: [file] });
+    expect(dropped).toContain("  ---------- Not carried over ----------");
+    expect(dropped).not.toContain("  Carry over");
   });
 
   it("handles the empty case concisely", () => {
@@ -103,7 +141,438 @@ describe("rendering", () => {
   });
 });
 
+describe("carry-over selection", () => {
+  const file = (name: string, content: string): InstructionFile => ({
+    key: `/proj/${name}`,
+    displayPath: name,
+    content,
+    delivery: "system",
+  });
+
+  it("ranks by hits under a shared UTF-8 budget and omits one-hit files", () => {
+    const files = [
+      file("tests/a/AGENTS.md", "é".repeat(3)),
+      file("tests/b/AGENTS.md", "b".repeat(4)),
+      file("tests/c/AGENTS.md", "c".repeat(4)),
+      file("tests/d/AGENTS.md", "d"),
+    ];
+    const hits = new Map(files.map((entry, index) => [entry.key, [3, 4, 2, 1][index]]));
+    expect(
+      selectCarryOver(files, hits, { maxBytes: 8, maxFiles: 0 }).map((entry) => entry.displayPath),
+    ).toEqual(["tests/b/AGENTS.md", "tests/c/AGENTS.md"]);
+    expect(
+      selectCarryOver(files, hits, { maxBytes: 0, maxFiles: 1 }).map((entry) => entry.displayPath),
+    ).toEqual(["tests/b/AGENTS.md"]);
+    expect(selectCarryOver(files.slice(0, 1), hits, { maxBytes: 5, maxFiles: 0 })).toEqual([]);
+    expect(selectCarryOver(files.slice(0, 1), hits, { maxBytes: 6, maxFiles: 0 })).toEqual([
+      files[0],
+    ]);
+  });
+
+  it("includes qualifying managed parents before a child or skips the child", () => {
+    const parent = file("tests/AGENTS.md", "parent");
+    const child = file("tests/sub/AGENTS.md", "child");
+    const other = file("docs/AGENTS.md", "other");
+    const files = [child, other, parent];
+    const hits = new Map([
+      [child.key, 5],
+      [parent.key, 2],
+      [other.key, 3],
+    ]);
+    expect(selectCarryOver(files, hits, { maxBytes: 11, maxFiles: 0 })).toEqual([parent, child]);
+    expect(selectCarryOver(files, hits, { maxBytes: 6, maxFiles: 0 })).toEqual([other]);
+    expect(selectCarryOver(files, hits, { maxBytes: 0, maxFiles: 1 })).toEqual([other]);
+    hits.set(parent.key, 1);
+    expect(selectCarryOver(files, hits, { maxBytes: 0, maxFiles: 0 })).toEqual([other]);
+  });
+
+  it("breaks ties by shallowest then alphabetical path", () => {
+    const files = [file("z/AGENTS.md", "z"), file("a/b/AGENTS.md", "b"), file("a/AGENTS.md", "a")];
+    const hits = new Map(files.map((entry) => [entry.key, 2]));
+    expect(
+      selectCarryOver(files, hits, { maxBytes: 0, maxFiles: 0 }).map((entry) => entry.displayPath),
+    ).toEqual(["a/AGENTS.md", "z/AGENTS.md", "a/b/AGENTS.md"]);
+  });
+});
+
 describe("instruction lifecycle", () => {
+  it("keeps section placement stable across discoveries in one run", {
+    timeout: 30000,
+  }, async () => {
+    const project = makeProject();
+    let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+    try {
+      project.write("tests/a/AGENTS.md", "alpha instructions");
+      project.write("tests/a/file.txt", "a");
+      project.write("tests/b/AGENTS.md", "beta instructions");
+      project.write("tests/b/file.txt", "b");
+      harness = await createHarness({
+        cwd: project.dir,
+        model: fauxModel({ supportsMidConvoSystemMessages: true }),
+        responses: [
+          readCall("tests/a/file.txt"),
+          readCall("tests/b/file.txt"),
+          assistantText("done"),
+          assistantText("continued"),
+        ],
+      });
+      await harness.session.prompt("read both");
+      const [first, second, third] = harness.faux.requests;
+      expect(sectionOf(first)).toBe("");
+      expect(sectionOf(second)).toContain("alpha instructions");
+      expect(sectionOf(third)).toContain("beta instructions");
+      expect(third.messages.slice(0, second.messages.length)).toEqual(second.messages);
+      await harness.session.prompt("continue");
+      expect(harness.faux.requests[3].messages.slice(0, third.messages.length)).toEqual(
+        third.messages,
+      );
+      expect(harness.extensionErrors).toEqual([]);
+    } finally {
+      harness?.cleanup();
+      project.cleanup();
+    }
+  });
+
+  it("keeps instructions when context edits omit their placement anchor", {
+    timeout: 30000,
+  }, async () => {
+    const project = makeProject();
+    let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+    try {
+      project.write("tests/AGENTS.md", "anchored instructions");
+      project.write("tests/file.txt", "x");
+      harness = await createHarness({
+        cwd: project.dir,
+        model: fauxModel({ supportsMidConvoSystemMessages: true }),
+        responses: [readCall("tests/file.txt"), assistantText("done"), assistantText("continued")],
+      });
+      await harness.session.prompt("read the file");
+      const entries = harness.sessionManager.getBranch();
+      const result = entries
+        .filter((entry) => entry.type === "message" && entry.message.role === "toolResult")
+        .at(-1);
+      const call = entries
+        .filter(
+          (entry) =>
+            entry.type === "message" &&
+            entry.message.role === "assistant" &&
+            entry.message.content.some((part) => part.type === "toolCall"),
+        )
+        .at(-1);
+      if (!result || !call) throw new Error("Expected the read call and result");
+      harness.sessionManager.appendContextEdit(call.id, null);
+      harness.sessionManager.appendContextEdit(result.id, null);
+      await harness.session.prompt("continue");
+      expect(sectionOf(harness.faux.requests[2])).toContain("anchored instructions");
+      expect(harness.extensionErrors).toEqual([]);
+    } finally {
+      harness?.cleanup();
+      project.cleanup();
+    }
+  });
+
+  it("excludes one-hit files from the first post-compaction request", {
+    timeout: 30000,
+  }, async () => {
+    const project = makeProject();
+    let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+    try {
+      project.write("AGENTS.md", "native instructions".repeat(20));
+      project.write(".pi/pi-agents-autoload.json", JSON.stringify({ maxBytes: 20 }));
+      project.write("tests/a/AGENTS.md", "keep instructions");
+      project.write("tests/a/file.txt", "a");
+      project.write("tests/b/AGENTS.md", "drop instructions");
+      project.write("tests/b/file.txt", "b");
+      const { notifications, uiContext } = notifyCapture();
+      harness = await createHarness({
+        cwd: project.dir,
+        trusted: true,
+        model: fauxModel({ supportsMidConvoSystemMessages: true }),
+        withCompactionHelper: true,
+        settings: { compaction: { keepRecentTokens: 1 } },
+        responses: [
+          readTwiceCall("tests/a/file.txt"),
+          assistantText("done"),
+          readCall("tests/b/file.txt"),
+          assistantText("done again"),
+          assistantText("ready"),
+          assistantText("continued"),
+        ],
+        uiContext,
+      });
+      await harness.session.prompt("read a");
+      await harness.session.prompt("read b");
+      await harness.session.prompt("ready");
+      await harness.session.prompt("/agents-md-status");
+      expect(notifications.at(-1)).toContain("Carry-over: 2+ hits | 20 B total");
+      expect(notifications.at(-1)).toContain("If compacted now: 1 of 2 managed");
+      expect(notifications.at(-1)).toContain("2 hits");
+      expect(notifications.at(-1)).toContain("1 hit");
+
+      await harness.session.compact();
+      const checkpoint = harness.sessionManager
+        .getBranch()
+        .find((entry) => entry.type === "compaction") as
+        | { systemMessage?: { sections?: Record<string, string | null> } }
+        | undefined;
+      expect(Object.values(checkpoint?.systemMessage?.sections ?? {}).join("\n")).not.toContain(
+        "drop instructions",
+      );
+      await harness.session.prompt("continue");
+      const request = harness.faux.requests[5];
+      expect(sectionOf(request)).toContain("keep instructions");
+      expect(sectionOf(request)).not.toContain("drop instructions");
+      expect(nativeSectionOf(request)).toContain("native instructions");
+      expect(
+        JSON.stringify(request.messages.filter((message) => message.role === "system")),
+      ).not.toContain("drop instructions");
+      expect(lastSnapshotData(harness.sessionManager)?.files).toHaveLength(1);
+      notifications.length = 0;
+      await harness.session.prompt("/agents-md-status");
+      expect(notifications[0]).toContain("0 hits");
+      expect(notifications[0]).toContain("If compacted now: 0 of 1 managed");
+    } finally {
+      harness?.cleanup();
+      project.cleanup();
+    }
+  });
+
+  it("keeps Pi's recent tool-result tail when a one-hit file is not selected", {
+    timeout: 30000,
+  }, async () => {
+    const project = makeProject();
+    let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+    try {
+      project.write("intro.txt", "old context ".repeat(400));
+      project.write("tests/AGENTS.md", "dropped parent instructions");
+      project.write("tests/sub/AGENTS.md", "dropped nested instructions");
+      project.write("tests/sub/file.txt", "original read payload");
+      harness = await createHarness({
+        cwd: project.dir,
+        model: fauxModel(),
+        withCompactionHelper: true,
+        settings: { compaction: { keepRecentTokens: 150 } },
+        responses: [
+          readCall("intro.txt"),
+          assistantText("done"),
+          readCall("tests/sub/file.txt"),
+          assistantText("done"),
+          assistantText("continued"),
+          readCall("tests/sub/file.txt"),
+          assistantText("done again"),
+        ],
+      });
+      await harness.session.prompt("read intro");
+      await harness.session.prompt("read nested");
+      expect(JSON.stringify(harness.faux.requests[3].messages)).toContain(
+        "dropped nested instructions",
+      );
+      await harness.session.compact();
+      await harness.session.prompt("continue");
+      const request = harness.faux.requests[4];
+      const results = request.messages.filter((message) => message.role === "toolResult");
+      expect(
+        results.some((message) =>
+          JSON.stringify(message.content).includes("original read payload"),
+        ),
+      ).toBe(true);
+      expect(JSON.stringify(results)).toContain("dropped parent instructions");
+      expect(JSON.stringify(results)).toContain("dropped nested instructions");
+      expect(sectionOf(request)).not.toContain("dropped nested instructions");
+
+      await harness.session.prompt("read nested again");
+      const next = harness.faux.requests[6];
+      const texts = next.messages
+        .filter((message) => message.role === "toolResult")
+        .map((message) => JSON.stringify(message.content));
+      expect(texts.filter((text) => text.includes("original read payload"))).toHaveLength(2);
+      expect(texts.filter((text) => text.includes("dropped parent instructions"))).toHaveLength(2);
+      expect(texts.filter((text) => text.includes("dropped nested instructions"))).toHaveLength(2);
+    } finally {
+      harness?.cleanup();
+      project.cleanup();
+    }
+  });
+
+  it("promotes selected instructions while preserving Pi's recent tool-result tail", {
+    timeout: 30000,
+  }, async () => {
+    const project = makeProject();
+    let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+    try {
+      project.write("intro.txt", "old context ".repeat(400));
+      project.write("tests/AGENTS.md", "selected nested instructions");
+      project.write("tests/file.txt", "original read payload");
+      harness = await createHarness({
+        cwd: project.dir,
+        model: fauxModel(),
+        withCompactionHelper: true,
+        settings: { compaction: { keepRecentTokens: 150 } },
+        responses: [
+          readCall("intro.txt"),
+          assistantText("done"),
+          readTwiceCall("tests/file.txt"),
+          assistantText("done"),
+          assistantText("continued"),
+        ],
+      });
+      await harness.session.prompt("read intro");
+      await harness.session.prompt("read nested twice");
+      await harness.session.compact();
+      await harness.session.prompt("continue");
+      const request = harness.faux.requests[4];
+      const results = request.messages.filter((message) => message.role === "toolResult");
+      expect(
+        results.filter((message) =>
+          JSON.stringify(message.content).includes("original read payload"),
+        ),
+      ).toHaveLength(2);
+      expect(JSON.stringify(results)).toContain("selected nested instructions");
+      expect(sectionOf(request)).toContain("selected nested instructions");
+    } finally {
+      harness?.cleanup();
+      project.cleanup();
+    }
+  });
+
+  it("preserves recent injected text across resume", {
+    timeout: 30000,
+  }, async () => {
+    const project = makeProject();
+    const sessionDir = mkdtempSync(join(tmpdir(), "pi-agents-autoload-sessions-"));
+    let first: Awaited<ReturnType<typeof createHarness>> | undefined;
+    let second: Awaited<ReturnType<typeof createHarness>> | undefined;
+    try {
+      project.write("intro.txt", "old context ".repeat(400));
+      project.write("tests/AGENTS.md", "recent injected instructions");
+      project.write("tests/file.txt", "recent original read");
+      first = await createHarness({
+        cwd: project.dir,
+        sessionDir,
+        model: fauxModel(),
+        withCompactionHelper: true,
+        settings: { compaction: { keepRecentTokens: 150 } },
+        responses: [
+          readCall("intro.txt"),
+          assistantText("done"),
+          readCall("tests/file.txt"),
+          assistantText("done"),
+        ],
+      });
+      const sessionFile = first.sessionFile;
+      await first.session.prompt("read intro");
+      await first.session.prompt("read nested");
+      await first.session.compact();
+      first.cleanup();
+      first = undefined;
+
+      second = await createHarness({
+        cwd: project.dir,
+        sessionDir,
+        sessionFile,
+        sessionStartEvent: { type: "session_start", reason: "resume" },
+        model: fauxModel(),
+        responses: [assistantText("continued"), readCall("tests/file.txt"), assistantText("done")],
+      });
+      await second.session.prompt("continue");
+      const results = second.faux.requests[0].messages.filter(
+        (message) => message.role === "toolResult",
+      );
+      expect(JSON.stringify(results)).toContain("recent original read");
+      expect(JSON.stringify(results)).toContain("recent injected instructions");
+      await second.session.prompt("read nested again");
+      const next = second.faux.requests[2].messages.filter(
+        (message) => message.role === "toolResult",
+      );
+      expect(
+        next.filter((message) => JSON.stringify(message.content).includes("recent original read")),
+      ).toHaveLength(2);
+      expect(
+        next.filter((message) =>
+          JSON.stringify(message.content).includes("recent injected instructions"),
+        ),
+      ).toHaveLength(2);
+    } finally {
+      first?.cleanup();
+      second?.cleanup();
+      project.cleanup();
+      rmSync(sessionDir, { recursive: true, force: true });
+    }
+  });
+
+  it("restores hit counts across resume before compaction", { timeout: 30000 }, async () => {
+    const project = makeProject();
+    const sessionDir = mkdtempSync(join(tmpdir(), "pi-agents-autoload-sessions-"));
+    let first: Awaited<ReturnType<typeof createHarness>> | undefined;
+    let second: Awaited<ReturnType<typeof createHarness>> | undefined;
+    try {
+      project.write("tests/AGENTS.md", "saved instructions");
+      project.write("tests/file.txt", "x");
+      first = await createHarness({
+        cwd: project.dir,
+        sessionDir,
+        model: fauxModel({ supportsMidConvoSystemMessages: true }),
+        responses: [readTwiceCall("tests/file.txt"), assistantText("done")],
+      });
+      const sessionFile = first.sessionFile;
+      await first.session.prompt("read twice");
+      expect(snapshotCount(first.sessionManager)).toBe(1);
+      first.cleanup();
+      first = undefined;
+
+      const { notifications, uiContext } = notifyCapture();
+      second = await createHarness({
+        cwd: project.dir,
+        sessionDir,
+        sessionFile,
+        sessionStartEvent: { type: "session_start", reason: "resume" },
+        model: fauxModel({ supportsMidConvoSystemMessages: true }),
+        withCompactionHelper: true,
+        settings: { compaction: { keepRecentTokens: 1 } },
+        responses: [assistantText("continued")],
+        uiContext,
+      });
+      await second.session.prompt("/agents-md-status");
+      expect(notifications[0]).toContain("2 hits");
+      expect(notifications[0]).toContain("If compacted now: 1 of 1 managed");
+      await second.session.compact();
+      await second.session.prompt("continue");
+      expect(sectionOf(second.faux.requests[0])).toContain("saved instructions");
+    } finally {
+      first?.cleanup();
+      second?.cleanup();
+      project.cleanup();
+      rmSync(sessionDir, { recursive: true, force: true });
+    }
+  });
+
+  it("omits a one-hit system section on an automatic mid-run compaction retry", {
+    timeout: 30000,
+  }, async () => {
+    const project = makeProject();
+    let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+    try {
+      project.write("tests/AGENTS.md", "one-hit instructions");
+      project.write("tests/file.txt", `${"x".repeat(80)}\n`.repeat(300));
+      harness = await createHarness({
+        cwd: project.dir,
+        model: fauxModel({ supportsMidConvoSystemMessages: true }),
+        withCompactionHelper: true,
+        settings: { compaction: { reserveTokens: 128000 - 500, keepRecentTokens: 1 } },
+        responses: [readCall("tests/file.txt"), assistantText("done"), assistantText("continued")],
+      });
+      await harness.session.prompt("read the file");
+      expect(
+        harness.sessionManager.getBranch().filter((entry) => entry.type === "compaction"),
+      ).toHaveLength(1);
+      expect(sectionOf(harness.faux.requests[1])).toBe("");
+      expect(lastSnapshotData(harness.sessionManager)?.files).toEqual([]);
+    } finally {
+      harness?.cleanup();
+      project.cleanup();
+    }
+  });
+
   it("promotes deferred instructions to the system section when compaction retains them", {
     timeout: 30000,
   }, async () => {
@@ -125,7 +594,7 @@ describe("instruction lifecycle", () => {
         // does not re-trigger after the run ends.
         settings: { compaction: { reserveTokens: 128000 - 500, keepRecentTokens: 1 } },
         responses: [
-          readCall("tests/file.txt"),
+          readTwiceCall("tests/file.txt"),
           assistantText("done"),
           assistantText("continued"),
           readCall("tests/small.txt"),
@@ -138,7 +607,9 @@ describe("instruction lifecycle", () => {
       await harness.session.prompt("read the file");
 
       // Delivered deferred-style before compaction.
-      expect(toolResultTexts(harness.sessionManager)[0]).toContain(DEFERRED_LEAD_IN);
+      expect(
+        toolResultTexts(harness.sessionManager).some((text) => text.includes(DEFERRED_LEAD_IN)),
+      ).toBe(true);
       // The mid-run compaction retained the file and promoted it to system
       // delivery, since the tool result that carried it was compacted away.
       expect(
@@ -146,7 +617,7 @@ describe("instruction lifecycle", () => {
       ).toHaveLength(1);
       const retained = lastSnapshotData(harness.sessionManager)?.files ?? [];
       expect(retained).toHaveLength(1);
-      expect(retained[0]).toMatchObject({ delivery: "system", usedSinceCompact: false });
+      expect(retained[0]).toMatchObject({ delivery: "system" });
       // The retry request in the same run carries the promoted instructions.
       expect(sectionOf(harness.faux.requests[1])).toContain(NESTED_MARKER);
       expect(sectionOf(harness.faux.requests[1])).toContain("tests: run with vitest");
@@ -161,16 +632,14 @@ describe("instruction lifecycle", () => {
       notifications.length = 0;
       await harness.session.prompt("/agents-md-status");
       expect(notifications[0]).toContain("Mode: auto (default) → deferred");
-      expect(notifications[0]).toMatch(/1 {2}tests\/AGENTS\.md \(System, ~\d+ tokens\)/);
+      expect(notifications[0]).toMatch(/ {2}- tests\/AGENTS\.md +\(~\d+ tokens · 0 hits\)/);
 
       // Re-access renews the file without a second tool-result delivery.
       await harness.session.prompt("read the file again");
       const texts = toolResultTexts(harness.sessionManager);
       expect(texts.filter((text) => text.includes(DEFERRED_LEAD_IN))).toHaveLength(1);
       expect(sectionOf(harness.faux.requests[4])).toContain(NESTED_MARKER);
-      expect(lastSnapshotData(harness.sessionManager)?.files[0]).toMatchObject({
-        usedSinceCompact: true,
-      });
+      expect(lastHitCounts(harness.sessionManager).get("tests/AGENTS.md")).toBe(1);
 
       // A full cycle without access expires them.
       await harness.session.compact();
@@ -185,7 +654,7 @@ describe("instruction lifecycle", () => {
     }
   });
 
-  it("retains used instructions across the first compaction and expires them after an unused one", {
+  it("retains frequently accessed instructions and expires them after an unused cycle", {
     timeout: 30000,
   }, async () => {
     const project = makeProject();
@@ -200,12 +669,12 @@ describe("instruction lifecycle", () => {
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
         responses: [
-          readCall("tests/file.txt"),
+          readTwiceCall("tests/file.txt"),
           assistantText("done"),
           assistantText("continued"),
           assistantText("continued again"),
           assistantText("idle"),
-          readCall("tests/file.txt"),
+          readTwiceCall("tests/file.txt"),
           assistantText("done"),
         ],
       });
@@ -213,21 +682,22 @@ describe("instruction lifecycle", () => {
       await harness.session.prompt("continue");
       expect(sectionOf(harness.faux.requests[2])).toContain(NESTED_MARKER);
 
-      // Manual compaction retains the used file for one more cycle: the
-      // checkpoint still carries the promoted file...
+      // The persisted placement rebase carries the selected file after compaction.
       await harness.session.compact();
       const compaction = harness.sessionManager
         .getBranch()
         .find((entry) => entry.type === "compaction") as
         | { systemMessage?: { sections?: Record<string, string | null> } }
         | undefined;
-      expect(compaction?.systemMessage?.sections?.pi_agents_md).toContain(NESTED_MARKER);
-      // ...marked as unused for the new cycle, in system delivery.
+      expect(Object.values(compaction?.systemMessage?.sections ?? {}).join("\n")).not.toContain(
+        NESTED_MARKER,
+      );
+      // ...promoted to system delivery with its hits reset.
       const retained = lastSnapshotData(harness.sessionManager)?.files ?? [];
       expect(retained).toHaveLength(1);
-      expect(retained[0]).toMatchObject({ delivery: "system", usedSinceCompact: false });
+      expect(retained[0]).toMatchObject({ delivery: "system" });
 
-      // ...and the next request still applies it, with no patch needed.
+      // The next request replays the same anchored section.
       await harness.session.prompt("continue again");
       const thirdRequest = harness.faux.requests[3];
       expect(lastMessage(thirdRequest)?.role).not.toBe("system");
@@ -246,8 +716,7 @@ describe("instruction lifecycle", () => {
       expect(lastMessage(fourthRequest)?.role).not.toBe("system");
       expect(sectionOf(fourthRequest)).toBe("");
       expect(nativeSectionOf(fourthRequest)).toContain("root: use tabs everywhere");
-      const patches = persistedSectionPatches(harness.sessionManager);
-      expect(patches.at(-1)).toBeNull();
+      expect(sectionOf(fourthRequest)).toBe("");
 
       // The next access rediscovers the file into the system prompt.
       await harness.session.prompt("read the file again");
@@ -279,6 +748,7 @@ describe("instruction lifecycle", () => {
           assistantText("continued"),
           readCall("tests/big.txt"),
           assistantText("done"),
+          assistantText("idle"),
           assistantText("continued again"),
         ],
       });
@@ -287,9 +757,8 @@ describe("instruction lifecycle", () => {
       expect(sectionOf(harness.faux.requests[2])).toContain(NESTED_MARKER);
 
       // The big read crosses the threshold mid-run: compaction, then the
-      // retry request in the same run. The retained instructions stay in the
-      // effective section, carried by the compaction checkpoint, so no
-      // ephemeral patch is needed.
+      // retry request in the same run. The selected files are rebased at the
+      // summary; the same patch stays there on the next user turn.
       await harness.session.prompt("read the big file");
       const retryRequest = harness.faux.requests[4];
       expect(lastMessage(retryRequest)?.role).not.toBe("system");
@@ -299,10 +768,15 @@ describe("instruction lifecycle", () => {
         harness.sessionManager.getBranch().filter((entry) => entry.type === "compaction"),
       ).toHaveLength(1);
 
-      // An unused cycle expires them: the next run records the durable removal.
+      await harness.session.prompt("sit idle");
+      expect(harness.faux.requests[5].messages.slice(0, retryRequest.messages.length)).toEqual(
+        retryRequest.messages,
+      );
+
+      // An unused cycle expires them at the next compaction.
       await harness.session.compact();
       await harness.session.prompt("continue again");
-      const lastRequest = harness.faux.requests[5];
+      const lastRequest = harness.faux.requests[6];
       expect(lastMessage(lastRequest)?.role).not.toBe("system");
       expect(sectionOf(lastRequest)).toBe("");
     } finally {
@@ -327,11 +801,11 @@ describe("instruction lifecycle", () => {
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
         responses: [
-          readCall("tests/a.txt"),
+          readTwiceCall("tests/a.txt"),
           assistantText("done"),
-          readCall("tests/b.txt"),
+          readTwiceCall("tests/b.txt"),
           assistantText("done again"),
-          readCall("tests/a.txt"),
+          readTwiceCall("tests/a.txt"),
           assistantText("done once more"),
         ],
         uiContext,
@@ -379,12 +853,12 @@ describe("instruction lifecycle", () => {
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
         responses: [
-          readCall("tests/integration/file.txt"),
+          readTwiceCall("tests/integration/file.txt"),
           assistantText("done"),
-          readCall("osac-operator/file.txt"),
+          readTwiceCall("osac-operator/file.txt"),
           assistantText("done again"),
           assistantText("idle"),
-          readCall("tests/integration/file.txt"),
+          readTwiceCall("tests/integration/file.txt"),
           assistantText("done once more"),
           assistantText("idle again"),
         ],
@@ -393,7 +867,7 @@ describe("instruction lifecycle", () => {
       // Cycle 1: parent and child discovered.
       await harness.session.prompt("read the file");
       await harness.session.compact(); // both retained
-      // Cycle 2: only osac-operator is used; it gets its own grace period.
+      // Cycle 2: only osac-operator earns carry-over.
       await harness.session.prompt("read the operator file");
       await harness.session.compact(); // tests/* expire, osac retained
       await harness.session.prompt("idle");
@@ -436,9 +910,12 @@ describe("instruction lifecycle", () => {
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
         responses: [
-          readCall("tests/a.txt"),
+          readTwiceCall("tests/a.txt"),
           assistantText("done"),
-          assistantToolCalls([{ name: "edit", args: editArgs }]),
+          assistantToolCalls([
+            { name: "edit", args: editArgs },
+            { name: "read", args: { path: "tests/a.txt" } },
+          ]),
           assistantText("edited"),
           assistantText("continued"),
         ],
@@ -483,7 +960,7 @@ describe("instruction lifecycle", () => {
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
         responses: [
-          readCall("tests/a.txt"),
+          readTwiceCall("tests/a.txt"),
           assistantText("done"),
           assistantToolCalls([{ name: "edit", args: editArgs }]),
           assistantToolCalls([{ name: "edit", args: editArgs }]),
@@ -527,7 +1004,7 @@ describe("instruction lifecycle", () => {
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
         responses: [
-          readCall("tests/file.txt"),
+          readTwiceCall("tests/file.txt"),
           assistantText("done"),
           readCall("tests/missing.txt"),
           assistantText("missing"),
@@ -562,12 +1039,12 @@ describe("instruction lifecycle", () => {
         model: fauxModel({ supportsMidConvoSystemMessages: true }),
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
-        responses: [readCall("tests/file.txt"), assistantText("done"), assistantText("idle")],
+        responses: [readTwiceCall("tests/file.txt"), assistantText("done"), assistantText("idle")],
       });
       await harness.session.prompt("read the file");
 
-      // A cancelled compaction must not age the instructions: they were used
-      // this cycle, so the next successful compaction still retains them.
+      // A cancelled compaction leaves both hits intact, so the next
+      // successful compaction still retains the instructions.
       project.write("cancel-compaction", "");
       await expect(harness.session.compact()).rejects.toThrow("Compaction cancelled");
       // Remove the marker so the next compaction succeeds.
@@ -597,7 +1074,7 @@ describe("instruction lifecycle", () => {
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
         responses: [
-          readCall("tests/a.txt"),
+          readTwiceCall("tests/a.txt"),
           assistantText("done"),
           assistantToolCalls([
             { name: "read", args: { path: "tests/a.txt" } },
@@ -615,7 +1092,8 @@ describe("instruction lifecycle", () => {
       // Both parallel reads renew the same file: one registry change, no
       // second delivery, no second notification.
       await harness.session.prompt("read both");
-      expect(snapshotCount(harness.sessionManager)).toBe(3); // one renewal
+      expect(snapshotCount(harness.sessionManager)).toBe(2); // unchanged content needs no snapshot
+      expect(lastHitCounts(harness.sessionManager).get("tests/AGENTS.md")).toBe(2);
       const texts = toolResultTexts(harness.sessionManager);
       expect(texts.filter((text) => text.includes(DEFERRED_LEAD_IN))).toHaveLength(1);
       expect(notifications).toHaveLength(1);
@@ -639,7 +1117,7 @@ describe("instruction lifecycle", () => {
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
         responses: [
-          readCall("tests/file.txt"),
+          readTwiceCall("tests/file.txt"),
           assistantText("done"),
           assistantText("continued"),
           assistantText("idle"),
@@ -647,7 +1125,7 @@ describe("instruction lifecycle", () => {
       });
       await harness.session.prompt("read the file");
       expect(sectionOf(harness.faux.requests[1])).toContain(NESTED_MARKER);
-      await harness.session.compact(); // retained, unused for the new cycle
+      await harness.session.compact(); // retained with hits reset
 
       // Switching to a model without mid-conversation system messages keeps
       // the retained instructions in the prompt, exactly once.
@@ -656,8 +1134,7 @@ describe("instruction lifecycle", () => {
       expect(sectionOf(harness.faux.requests[2])).toContain(NESTED_MARKER);
       expect(sectionOf(harness.faux.requests[2]).split("tests: run with vitest")).toHaveLength(2);
 
-      // The switch does not reset the usage flag: without another access,
-      // the next compaction expires the instructions.
+      // The switch does not add hits: the next compaction expires the file.
       await harness.session.compact();
       await harness.session.prompt("sit idle");
       expect(sectionOf(harness.faux.requests[3])).not.toContain(NESTED_MARKER);
@@ -701,8 +1178,8 @@ describe("instruction lifecycle", () => {
       await harness.session.prompt("/agents-md-status");
 
       expect(notifications).toHaveLength(1);
-      expect(notifications[0]).toMatch(/1 {2}tests\/b\/AGENTS\.md \(Tool result, ~\d+ tokens\)/);
-      expect(notifications[0]).toMatch(/2 {2}tests\/a\/AGENTS\.md \(Tool result, ~\d+ tokens\)/);
+      expect(notifications[0]).toMatch(/ {2}- tests\/b\/AGENTS\.md +\(~\d+ tokens · 1 hit\)/);
+      expect(notifications[0]).toMatch(/ {2}- tests\/a\/AGENTS\.md +\(~\d+ tokens · 1 hit\)/);
     } finally {
       harness?.cleanup();
       project.cleanup();
@@ -805,7 +1282,6 @@ describe("instruction lifecycle", () => {
               path,
               content: `invalid instructions from ${path}`,
               delivery: "system",
-              usedSinceCompact: true,
             });
           }
         }
@@ -896,11 +1372,11 @@ describe("instruction lifecycle", () => {
         model: fauxModel({ supportsMidConvoSystemMessages: true }),
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
-        responses: [readCall("tests/file.txt"), assistantText("done")],
+        responses: [readTwiceCall("tests/file.txt"), assistantText("done")],
       });
       const sessionFile = first.sessionFile;
       await first.session.prompt("read the file");
-      await first.session.compact(); // retained, unused for the new cycle
+      await first.session.compact(); // retained with hits reset
       first.cleanup();
       first = undefined;
 
@@ -912,12 +1388,11 @@ describe("instruction lifecycle", () => {
         sessionFile,
         sessionStartEvent: { type: "session_start", reason: "resume" },
         model: fauxModel({ supportsMidConvoSystemMessages: true }),
-        responses: [readCall("tests/file.txt"), assistantText("done")],
+        responses: [readTwiceCall("tests/file.txt"), assistantText("done")],
       });
       await second.session.prompt("read the file again");
 
-      // The retained file stays active across the resume, still unused and
-      // carrying the snapshotted content...
+      // The retained file stays active across the resume with its snapshotted content...
       expect(sectionOf(second.faux.requests[0])).toContain("before compaction content");
       // ...and the first re-access renews it, refreshing the changed content.
       expect(sectionOf(second.faux.requests[1])).toContain("after compaction content");
@@ -949,15 +1424,15 @@ describe("instruction lifecycle", () => {
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
         responses: [
-          readCall("tests/a/file.txt"),
+          readTwiceCall("tests/a/file.txt"),
           assistantText("done"),
-          readCall("tests/b/file.txt"),
+          readTwiceCall("tests/b/file.txt"),
           assistantText("done again"),
         ],
       });
       const sessionFile = first.sessionFile;
       await first.session.prompt("read a");
-      await first.session.compact(); // a retained, now unused
+      await first.session.compact(); // a retained with hits reset
       await first.session.prompt("read b"); // b discovered; a stays idle
       first.cleanup();
       first = undefined;
@@ -987,7 +1462,7 @@ describe("instruction lifecycle", () => {
     }
   });
 
-  it("restores snapshots written before usage tracking with one grace cycle", {
+  it("restores snapshots without hit counts and drops them on compaction", {
     timeout: 30000,
   }, async () => {
     const project = makeProject();
@@ -1003,7 +1478,7 @@ describe("instruction lifecycle", () => {
         model: fauxModel({ supportsMidConvoSystemMessages: true }),
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
-        responses: [readCall("tests/file.txt"), assistantText("done")],
+        responses: [readTwiceCall("tests/file.txt"), assistantText("done")],
       });
       const sessionFile = first.sessionFile;
       await first.session.prompt("read the file");
@@ -1011,18 +1486,11 @@ describe("instruction lifecycle", () => {
       first.cleanup();
       first = undefined;
 
-      // Strip the usage flag from the persisted snapshot, as written by
-      // versions before usage tracking.
+      // Strip the hit entries to simulate an older session.
       const sessionLines = readFileSync(sessionFile, "utf8").trim().split("\n");
       const rewritten = sessionLines.map((line) => {
-        const entry = JSON.parse(line) as {
-          type?: string;
-          customType?: string;
-          data?: { files?: Array<Record<string, unknown>> };
-        };
-        if (entry.type === "custom" && entry.customType === "pi-agents-autoload") {
-          for (const file of entry.data?.files ?? []) delete file.usedSinceCompact;
-        }
+        const entry = JSON.parse(line) as { customType?: string };
+        if (entry.customType === "pi-agents-autoload-hits") entry.customType = "legacy-hits";
         return JSON.stringify(entry);
       });
       writeFileSync(sessionFile, `${rewritten.join("\n")}\n`, "utf8");
@@ -1037,12 +1505,12 @@ describe("instruction lifecycle", () => {
         settings: { compaction: { keepRecentTokens: 1 } },
         responses: [assistantText("continued"), assistantText("sat idle")],
       });
-      // The flag-less snapshot restores as used, so the file survives one
-      // more compaction instead of expiring immediately.
+      // A legacy snapshot without hit counts remains readable until compaction.
       await second.session.prompt("continue");
+      expect(sectionOf(second.faux.requests[0])).toContain("legacy instructions");
       await second.session.compact();
       await second.session.prompt("sit idle");
-      expect(sectionOf(second.faux.requests[1])).toContain("legacy instructions");
+      expect(sectionOf(second.faux.requests[1])).not.toContain("legacy instructions");
     } finally {
       first?.cleanup();
       second?.cleanup();
@@ -1051,7 +1519,7 @@ describe("instruction lifecycle", () => {
     }
   });
 
-  it("restores usage flags when navigating the session tree", {
+  it("restores hit counts when navigating the session tree", {
     timeout: 30000,
   }, async () => {
     const project = makeProject();
@@ -1064,17 +1532,16 @@ describe("instruction lifecycle", () => {
         model: fauxModel({ supportsMidConvoSystemMessages: true }),
         withCompactionHelper: true,
         settings: { compaction: { keepRecentTokens: 1 } },
-        responses: [readCall("tests/file.txt"), assistantText("done"), assistantText("idle")],
+        responses: [readTwiceCall("tests/file.txt"), assistantText("done"), assistantText("idle")],
       });
       await harness.session.prompt("read the file");
       const leafAfterDiscovery = harness.sessionManager.getLeafId();
       if (!leafAfterDiscovery) throw new Error("no leaf after discovery");
 
-      // The compaction retains the file and marks it unused.
+      // The compaction retains the file and resets its hits.
       await harness.session.compact();
 
-      // Navigating back to the discovery point restores the branch state
-      // where the file was used this cycle, so a compaction there retains it.
+      // Navigating back to discovery restores two hits on that branch.
       await harness.session.navigateTree(leafAfterDiscovery, { summarize: false });
       await harness.session.compact();
       await harness.session.prompt("sit idle");
@@ -1167,7 +1634,11 @@ describe("refresh and deletion", () => {
 
       // The changed content reaches the model on the very next request,
       // with no compaction in between, and only once.
-      const refreshed = sectionOf(harness.faux.requests[3]);
+      const refreshedRequest = harness.faux.requests[3];
+      expect(refreshedRequest.messages.slice(0, harness.faux.requests[1].messages.length)).toEqual(
+        harness.faux.requests[1].messages,
+      );
+      const refreshed = sectionOf(refreshedRequest);
       expect(refreshed).toContain("tests: run with vitest and lint");
       expect(refreshed).not.toContain("tests: run with vitest\n");
       expect(refreshed.split("tests: run with vitest and lint")).toHaveLength(2);
@@ -1328,8 +1799,18 @@ describe("refresh and deletion", () => {
       const texts = toolResultTexts(harness.sessionManager);
       expect(texts.every((text) => !text.includes("Blocked:"))).toBe(true);
       expect(project.read("tests/target.txt")).toBe("gamma\nbeta\n");
-      // The next run records the durable section removal.
-      expect(persistedSectionPatches(harness.sessionManager).at(-1)).toBeNull();
+      // The removal is anchored after the read that noticed the deletion.
+      const patches = harness.sessionManager
+        .getBranch()
+        .filter(
+          (entry) => entry.type === "custom" && entry.customType === "pi-agents-autoload-sections",
+        );
+      const removed = patches.at(-1);
+      expect(
+        removed?.type === "custom"
+          ? Object.values((removed.data as { sections: Record<string, string | null> }).sections)
+          : [],
+      ).toEqual([null]);
     } finally {
       harness?.cleanup();
       project.cleanup();
@@ -1398,12 +1879,14 @@ describe("refresh and deletion", () => {
       await harness.session.prompt("read b");
       await harness.session.prompt("read a once more");
 
-      // Checking unchanged instructions is invisible to the model and the
-      // transcript: one durable patch, one snapshot, one notification.
+      // Checking unchanged instructions adds no further placement or snapshot entries.
       expect(
-        persistedSectionPatches(harness.sessionManager).filter((section) =>
-          section?.includes(NESTED_MARKER),
-        ),
+        harness.sessionManager
+          .getBranch()
+          .filter(
+            (entry) =>
+              entry.type === "custom" && entry.customType === "pi-agents-autoload-sections",
+          ),
       ).toHaveLength(1);
       expect(snapshotCount(harness.sessionManager)).toBe(1);
       expect(notifications).toHaveLength(1);

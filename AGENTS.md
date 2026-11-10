@@ -13,10 +13,12 @@ scripted model.
   `@earendil-works/pi-ai`); do not import private Pi internals.
 - Try changes without installing: `pi -e ./src/index.ts`. Disable any installed
   copy first to avoid loading the extension twice.
-- Nested instructions survive one compaction cycle of disuse: compaction
-  retains files used during the cycle (promoting tool-result delivery to the
-  `pi_agents_md` system section) and expires files that went a full cycle
-  unused. File access renews a file; changed content is refreshed and deleted files
-  dropped on the next relevant access, independent of compaction.
+- Compaction retains managed files with at least two successful access hits
+  during the cycle, ranked within a shared 80 KiB default UTF-8 content budget;
+  applicable managed parents must fit too. Selected files receive per-file
+  system sections anchored after the compaction summary; unselected sections
+  are omitted while Pi's recent tool-result history remains intact. Pi-native
+  instructions are outside this budget. Access refreshes changed content and
+  drops deleted files independently of compaction.
 - Prefer small functions and explicit state transitions; avoid event buses,
   dependency injection, and other abstractions the code does not need.

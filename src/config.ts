@@ -3,10 +3,10 @@
  * `~/.pi/agent/pi-agents-autoload.json` and the trusted project's
  * `.pi/pi-agents-autoload.json`. Each field resolves independently:
  * trusted project value over global value over the default, so a project
- * that sets only `ignore` inherits the global `mode`. An explicitly empty
- * project `ignore` array overrides the global one. Invalid files throw
- * errors naming the file; they surface through Pi's extension error
- * reporting.
+ * that sets only one field inherits the remaining global values. An
+ * explicitly empty project `ignore` array overrides the global one.
+ * Invalid files throw errors naming the file; they surface through Pi's
+ * extension error reporting.
  */
 
 import * as fs from "node:fs/promises";
@@ -15,6 +15,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 
 export const CONFIG_FILE_NAME = "pi-agents-autoload.json";
+export const DEFAULT_MAX_BYTES = 80 * 1024;
 
 export type Mode = "auto" | "immediate" | "deferred";
 
@@ -27,12 +28,16 @@ export interface ExtensionConfig {
   modeOrigin: ConfigOrigin;
   /** Glob patterns for project-relative instruction paths excluded from automatic loading. */
   ignore: string[];
+  maxBytes: number;
+  maxFiles: number;
 }
 
 /** Fields present in one configuration file. */
 interface ConfigFileContents {
   mode?: Mode;
   ignore?: string[];
+  maxBytes?: number;
+  maxFiles?: number;
 }
 
 /** Parse and validate a configured mode value. */
@@ -78,7 +83,12 @@ export async function readConfigFile(file: string): Promise<ConfigFileContents> 
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error(`${file}: expected a JSON object`);
   }
-  const record = parsed as { mode?: unknown; ignore?: unknown };
+  const record = parsed as {
+    mode?: unknown;
+    ignore?: unknown;
+    maxBytes?: unknown;
+    maxFiles?: unknown;
+  };
   const contents: ConfigFileContents = {};
   if (record.mode !== undefined) {
     if (typeof record.mode !== "string") {
@@ -106,6 +116,14 @@ export async function readConfigFile(file: string): Promise<ConfigFileContents> 
     }
     contents.ignore = record.ignore;
   }
+  for (const name of ["maxBytes", "maxFiles"] as const) {
+    const value = record[name];
+    if (value === undefined) continue;
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`${file}: "${name}" must be a non-negative integer`);
+    }
+    contents[name] = value;
+  }
   return contents;
 }
 
@@ -125,5 +143,7 @@ export async function loadConfig(ctx: ExtensionContext): Promise<ExtensionConfig
     modeOrigin:
       project.mode !== undefined ? "project" : global.mode !== undefined ? "global" : "default",
     ignore: project.ignore ?? global.ignore ?? [],
+    maxBytes: project.maxBytes ?? global.maxBytes ?? DEFAULT_MAX_BYTES,
+    maxFiles: project.maxFiles ?? global.maxFiles ?? 0,
   };
 }

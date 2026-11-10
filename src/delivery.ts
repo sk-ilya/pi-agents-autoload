@@ -5,11 +5,17 @@
  * compatibility.
  */
 
+import { createHash } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Mode } from "./config";
 
-/** Dedicated system-prompt section for nested instructions. */
+/** Section names owned by this extension. The unsuffixed name belongs to older sessions. */
 export const SECTION_NAME = "pi_agents_md";
+export const FILE_SECTION_PREFIX = `${SECTION_NAME}_file_`;
+
+export function fileSectionName(displayPath: string): string {
+  return `${FILE_SECTION_PREFIX}${createHash("sha256").update(displayPath).digest("hex")}`;
+}
 
 const BLOCK_OPEN = '<project_instructions path="';
 const BLOCK_CLOSE = "</project_instructions>";
@@ -29,9 +35,8 @@ export function supportsMidConvoSystemMessages(ctx: ExtensionContext): boolean {
 }
 
 /**
- * Resolve "auto" against the active model. Mid-run system-prompt patches keep
- * the cached prefix only on models that accept mid-conversation system
- * messages; other models fall back to tool-result delivery.
+ * Resolve "auto" against the active model. Models that accept mid-conversation
+ * system messages receive anchored section updates; others use tool-result delivery.
  */
 export function effectiveMode(configured: Mode, ctx: ExtensionContext): "immediate" | "deferred" {
   if (configured === "immediate" || configured === "deferred") return configured;

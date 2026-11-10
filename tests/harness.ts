@@ -47,6 +47,7 @@ export const COMPACTION_HELPER_PATH = fileURLToPath(
   new URL("./compaction-helper.ts", import.meta.url),
 );
 const READ_RACE_HELPER_PATH = fileURLToPath(new URL("./read-race-helper.ts", import.meta.url));
+const NESTED_READ_HELPER_PATH = fileURLToPath(new URL("./nested-read-helper.ts", import.meta.url));
 
 /** The faux model is API-generic; the harness never inspects the API type. */
 type AnyModel =
@@ -154,11 +155,13 @@ export async function loadTestExtensions(options: {
   agentDir: string;
   withCompactionHelper?: boolean;
   withReadRaceHelper?: boolean;
+  withNestedReadHelper?: boolean;
 }): Promise<LoadExtensionsResult> {
   const paths = options.withReadRaceHelper
     ? [READ_RACE_HELPER_PATH, EXTENSION_PATH]
     : [EXTENSION_PATH];
   if (options.withCompactionHelper) paths.push(COMPACTION_HELPER_PATH);
+  if (options.withNestedReadHelper) paths.push(NESTED_READ_HELPER_PATH);
   const result = await discoverAndLoadExtensions(paths, options.cwd, options.agentDir);
   if (result.errors.length > 0) {
     throw new Error(`Failed to load test extensions: ${JSON.stringify(result.errors)}`);
@@ -172,6 +175,7 @@ export function createHarnessResourceLoader(options: {
   agentDir: string;
   withCompactionHelper?: boolean;
   withReadRaceHelper?: boolean;
+  withNestedReadHelper?: boolean;
   extensions: LoadExtensionsResult;
 }): ResourceLoader {
   let extensions = options.extensions;
@@ -206,6 +210,7 @@ export interface HarnessOptions {
   withCompactionHelper?: boolean;
   /** Change AGENTS.md between Pi's read and the extension's result handler. */
   withReadRaceHelper?: boolean;
+  withNestedReadHelper?: boolean;
   /** Use a file-backed session manager in this directory (for resume tests). */
   sessionDir?: string;
   /** Event emitted as the session starts (defaults to "startup"). */
@@ -259,12 +264,14 @@ export async function createHarness(options: HarnessOptions): Promise<Harness> {
     agentDir,
     withCompactionHelper: options.withCompactionHelper,
     withReadRaceHelper: options.withReadRaceHelper,
+    withNestedReadHelper: options.withNestedReadHelper,
   });
   const resourceLoader = createHarnessResourceLoader({
     cwd: options.cwd,
     agentDir,
     withCompactionHelper: options.withCompactionHelper,
     withReadRaceHelper: options.withReadRaceHelper,
+    withNestedReadHelper: options.withNestedReadHelper,
     extensions,
   });
 

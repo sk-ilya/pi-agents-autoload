@@ -5,6 +5,7 @@
 
 import { getCurrentSystemMessage, type TranscriptContext } from "@earendil-works/pi-ai";
 import type { ExtensionUIContext, SessionManager } from "@earendil-works/pi-coding-agent";
+import { FILE_SECTION_PREFIX } from "../src/delivery";
 import { assistantToolCalls, type Project } from "./harness";
 
 export const DEFERRED_LEAD_IN = "Discovered nested AGENTS.md instructions";
@@ -49,28 +50,15 @@ export function lastMessage(context: TranscriptContext) {
 }
 
 export function sectionOf(context: TranscriptContext): string {
-  return getCurrentSystemMessage(context.messages)?.sections?.pi_agents_md ?? "";
+  const sections = getCurrentSystemMessage(context.messages)?.sections ?? {};
+  return Object.entries(sections)
+    .filter(([name]) => name.startsWith(FILE_SECTION_PREFIX))
+    .map(([, content]) => content)
+    .join("\n");
 }
 
 export function nativeSectionOf(context: TranscriptContext): string {
   return getCurrentSystemMessage(context.messages)?.sections?.project_context ?? "";
-}
-
-/** Persisted `pi_agents_md` section values (null = removal), in branch order. */
-export function persistedSectionPatches(sessionManager: SessionManager): Array<string | null> {
-  const sections: Array<string | null> = [];
-  for (const entry of sessionManager.getBranch()) {
-    if (entry.type !== "message") continue;
-    const message = entry.message as {
-      role?: string;
-      sections?: Record<string, string | null>;
-    };
-    if (message.role !== "system") continue;
-    if (message.sections && "pi_agents_md" in message.sections) {
-      sections.push(message.sections.pi_agents_md ?? null);
-    }
-  }
-  return sections;
 }
 
 export function snapshotCount(sessionManager: SessionManager): number {
@@ -85,7 +73,6 @@ export interface SnapshotView {
     path: string;
     content: string;
     delivery?: string;
-    usedSinceCompact?: boolean;
   }>;
 }
 
@@ -99,8 +86,25 @@ export function lastSnapshotData(sessionManager: SessionManager): SnapshotView |
   return data as SnapshotView | undefined;
 }
 
+export function lastHitCounts(sessionManager: SessionManager): Map<string, number> {
+  let counts: Array<[string, number]> = [];
+  for (const entry of sessionManager.getBranch()) {
+    if (entry.type === "custom" && entry.customType === "pi-agents-autoload-hits") {
+      counts = (entry.data as { counts: Array<[string, number]> }).counts;
+    }
+  }
+  return new Map(counts);
+}
+
 export function readCall(path: string) {
   return assistantToolCalls([{ name: "read", args: { path } }]);
+}
+
+export function readTwiceCall(path: string) {
+  return assistantToolCalls([
+    { name: "read", args: { path } },
+    { name: "read", args: { path } },
+  ]);
 }
 
 export function writeFixture(project: Project): void {

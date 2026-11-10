@@ -1,19 +1,12 @@
 /**
- * The active instruction registry: discovered files, their review and usage
- * state, snapshot persistence through `pi.appendEntry`, restoration from the
- * active session branch, and compaction aging.
- *
- * Three concepts stay separate per file:
- * - registered: the extension knows the file and its content;
- * - pending review: new or changed content still needs to reach the model
- *   before edits and writes under it may proceed;
- * - used since compaction: controls retention and expiry.
+ * Active instructions, pending review, hit counts, and session-branch
+ * persistence. Compaction selects from the current cycle's hits.
  */
 
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { isIgnoredPath } from "./config";
-import type { Delivery } from "./delivery";
+import { type ExtensionConfig, isIgnoredPath } from "./config";
+import { type Delivery, fileSectionName, renderInstructionBlocks } from "./delivery";
 import {
   type DiscoveredFile,
   type DiscoveryResult,
@@ -22,6 +15,19 @@ import {
 } from "./discovery";
 
 export const ENTRY_TYPE = "pi-agents-autoload";
+export const HITS_ENTRY_TYPE = "pi-agents-autoload-hits";
+export const PATCH_ENTRY_TYPE = "pi-agents-autoload-sections";
+export const MIN_HITS = 2;
+
+export interface SectionPatch {
+  afterId: string;
+  sections: Record<string, string | null>;
+}
+
+function sectionValue(file: Pick<InstructionFile, "displayPath" | "content">): string {
+  const name = fileSectionName(file.displayPath);
+  return `<${name}>\n${renderInstructionBlocks([file])}\n</${name}>`;
+}
 
 /** One discovered instruction file, snapshotted for the current session branch. */
 export interface InstructionFile {
@@ -36,8 +42,6 @@ export interface InstructionFile {
   displayPath: string;
   content: string;
   delivery: Delivery;
-  /** Whether the file was discovered or used during the current compaction cycle. */
-  usedSinceCompact: boolean;
   /**
    * Filesystem metadata for change detection; absent until the first
    * relevant access after a restore. Never persisted in snapshots.
@@ -50,12 +54,57 @@ interface SnapshotFile {
   path: string;
   content: string;
   delivery: Delivery;
-  /** Absent in snapshots written before usage tracking; restored as `true`. */
-  usedSinceCompact: boolean;
 }
 
 interface Snapshot {
   files: SnapshotFile[];
+}
+
+interface HitsSnapshot {
+  counts: Array<[string, number]>;
+}
+
+export function selectCarryOver(
+  files: readonly InstructionFile[],
+  hits: ReadonlyMap<string, number>,
+  limits: Pick<ExtensionConfig, "maxBytes" | "maxFiles">,
+): InstructionFile[] {
+  const byKey = new Map(files.map((file) => [file.key, file]));
+  const selected = new Set<string>();
+  const kept: InstructionFile[] = [];
+  let bytes = 0;
+  const ranked = [...files]
+    .filter((file) => (hits.get(file.key) ?? 0) >= MIN_HITS)
+    .sort((a, b) => {
+      const count = (hits.get(b.key) ?? 0) - (hits.get(a.key) ?? 0);
+      if (count !== 0) return count;
+      const depth = a.displayPath.split("/").length - b.displayPath.split("/").length;
+      return depth || a.displayPath.localeCompare(b.displayPath);
+    });
+  for (const file of ranked) {
+    if (selected.has(file.key)) continue;
+    const parents: InstructionFile[] = [];
+    let directory = path.dirname(file.key);
+    while (path.dirname(directory) !== directory) {
+      directory = path.dirname(directory);
+      const parent = byKey.get(path.join(directory, "AGENTS.md"));
+      if (parent && !selected.has(parent.key)) parents.unshift(parent);
+    }
+    if (parents.some((parent) => (hits.get(parent.key) ?? 0) < MIN_HITS)) continue;
+    const additions = [...parents, file];
+    const size = additions.reduce(
+      (total, entry) => total + Buffer.byteLength(entry.content, "utf8"),
+      0,
+    );
+    if (limits.maxFiles !== 0 && kept.length + additions.length > limits.maxFiles) continue;
+    if (limits.maxBytes !== 0 && bytes + size > limits.maxBytes) continue;
+    for (const entry of additions) {
+      selected.add(entry.key);
+      kept.push(entry);
+    }
+    bytes += size;
+  }
+  return kept;
 }
 
 export interface ObservedFiles {
@@ -68,7 +117,7 @@ export interface ObservedFiles {
 /**
  * Registry of active instruction files for one extension instance. State
  * transitions are explicit: discovery folds in through `observeDiscovered`,
- * usage ages through `ageForCompaction`, and history restores through
+ * hits reset through `ageForCompaction`, and history restores through
  * `restoreFromBranch`.
  */
 export class InstructionRegistry {
@@ -80,13 +129,48 @@ export class InstructionRegistry {
    * blocked until the next model request is prepared.
    */
   private readonly pendingReviewKeys = new Set<string>();
+  private readonly hitCounts = new Map<string, number>();
+  private readonly pendingSections = new Map<string, string | null>();
   private lastSnapshotJson: string | undefined;
+  private lastHitsJson: string | undefined;
 
   constructor(private readonly pi: ExtensionAPI) {}
 
   /** Active instruction files, in discovery order. */
   files(): InstructionFile[] {
     return [...this.activeFiles.values()];
+  }
+
+  hits(): ReadonlyMap<string, number> {
+    return this.hitCounts;
+  }
+
+  carryOver(limits: Pick<ExtensionConfig, "maxBytes" | "maxFiles">): InstructionFile[] {
+    return selectCarryOver(this.files(), this.hitCounts, limits);
+  }
+
+  recordHits(keys: readonly string[]): void {
+    let changed = false;
+    for (const key of new Set(keys)) {
+      if (!this.activeFiles.has(key)) continue;
+      this.hitCounts.set(key, (this.hitCounts.get(key) ?? 0) + 1);
+      changed = true;
+    }
+    if (changed) this.persistHits();
+  }
+
+  /** Collect the section changes made by the completed tool batch. */
+  takePendingSections(): Record<string, string | null> {
+    const sections = Object.fromEntries(this.pendingSections);
+    this.pendingSections.clear();
+    return sections;
+  }
+
+  /** System-delivered files in their current discovery order. */
+  systemSections(): Record<string, string> {
+    return Object.fromEntries(
+      this.systemFiles().map((file) => [fileSectionName(file.displayPath), sectionValue(file)]),
+    );
   }
 
   /** Whether the file's latest content still needs to reach the model. */
@@ -125,14 +209,11 @@ export class InstructionRegistry {
 
   private buildSnapshot(): Snapshot {
     return {
-      files: [...this.activeFiles.values()].map(
-        ({ displayPath, content, delivery, usedSinceCompact }) => ({
-          path: displayPath,
-          content,
-          delivery,
-          usedSinceCompact,
-        }),
-      ),
+      files: [...this.activeFiles.values()].map(({ displayPath, content, delivery }) => ({
+        path: displayPath,
+        content,
+        delivery,
+      })),
     };
   }
 
@@ -142,6 +223,23 @@ export class InstructionRegistry {
     if (json === this.lastSnapshotJson) return;
     this.pi.appendEntry(ENTRY_TYPE, snapshot);
     this.lastSnapshotJson = json;
+  }
+
+  private buildHitsSnapshot(): HitsSnapshot {
+    const counts: HitsSnapshot["counts"] = [];
+    for (const file of this.activeFiles.values()) {
+      const hits = this.hitCounts.get(file.key);
+      if (hits) counts.push([file.displayPath, hits]);
+    }
+    return { counts };
+  }
+
+  private persistHits(): void {
+    const snapshot = this.buildHitsSnapshot();
+    const json = JSON.stringify(snapshot);
+    if (json === this.lastHitsJson) return;
+    this.pi.appendEntry(HITS_ENTRY_TYPE, snapshot);
+    this.lastHitsJson = json;
   }
 
   /**
@@ -154,12 +252,16 @@ export class InstructionRegistry {
   async restoreFromBranch(ctx: ExtensionContext, ignore: readonly string[]): Promise<void> {
     this.activeFiles.clear();
     this.pendingReviewKeys.clear();
+    this.hitCounts.clear();
+    this.pendingSections.clear();
     this.lastSnapshotJson = undefined;
+    this.lastHitsJson = undefined;
     let snapshot: Snapshot | undefined;
+    let hits: HitsSnapshot | undefined;
     for (const entry of ctx.sessionManager.getBranch()) {
-      if (entry.type === "custom" && entry.customType === ENTRY_TYPE) {
-        snapshot = entry.data as Snapshot | undefined;
-      }
+      if (entry.type !== "custom") continue;
+      if (entry.customType === ENTRY_TYPE) snapshot = entry.data as Snapshot | undefined;
+      if (entry.customType === HITS_ENTRY_TYPE) hits = entry.data as HitsSnapshot | undefined;
     }
     if (!snapshot || !Array.isArray(snapshot.files)) return;
     // Reconstruct the scoped keys the same way discovery builds them,
@@ -186,26 +288,23 @@ export class InstructionRegistry {
         displayPath: file.path,
         content: file.content,
         delivery: file.delivery === "toolResult" ? "toolResult" : "system",
-        // Snapshots from before usage tracking carry no flag; give those
-        // files one full grace cycle.
-        usedSinceCompact: file.usedSinceCompact !== false,
       });
     }
     this.lastSnapshotJson = JSON.stringify(this.buildSnapshot());
+    if (Array.isArray(hits?.counts)) {
+      const byPath = new Map(this.files().map((file) => [file.displayPath, file.key]));
+      for (const [displayPath, count] of hits.counts) {
+        const key = byPath.get(displayPath);
+        if (key && Number.isSafeInteger(count) && count >= 0) this.hitCounts.set(key, count);
+      }
+    }
+    this.lastHitsJson = JSON.stringify(this.buildHitsSnapshot());
   }
 
   /**
-   * Fold a discovery into the registry: register new files, renew retained
-   * ones, refresh retained files whose content changed, and remove entries
-   * for instruction files that no longer exist. Content freshness is
-   * independent of the compaction lifecycle: a file can be registered and
-   * unchanged while unused, or registered and used while its changed
-   * content is pending review. Newly added or changed files stay pending
-   * review until the next model request delivers them. Called after
-   * asynchronous discovery, so it is the recheck point for concurrent tool
-   * calls: files registered by another call in between are treated as
-   * already known. Persists only when the registry changed; a fingerprint
-   * refresh alone never produces a snapshot or any model-facing change.
+   * Fold discovery into the registry: add or refresh files, drop missing
+   * files, and require review for new content before edits and writes. Only
+   * changes to the active files produce a full-content snapshot.
    */
   observeDiscovered(result: DiscoveryResult, delivery: Delivery): ObservedFiles {
     const added: InstructionFile[] = [];
@@ -214,15 +313,11 @@ export class InstructionRegistry {
     for (const file of result.files) {
       const existing = this.activeFiles.get(file.key);
       if (existing === undefined) {
-        const record: InstructionFile = { ...file, delivery, usedSinceCompact: true };
+        const record: InstructionFile = { ...file, delivery };
         this.activeFiles.set(record.key, record);
         added.push(record);
         changed = true;
         continue;
-      }
-      if (!existing.usedSinceCompact) {
-        existing.usedSinceCompact = true;
-        changed = true;
       }
       existing.fingerprint = file.fingerprint;
       if (file.content !== existing.content) {
@@ -234,12 +329,19 @@ export class InstructionRegistry {
     for (const key of result.missingKeys) {
       const existing = this.activeFiles.get(key);
       if (existing === undefined) continue;
+      if (existing.delivery === "system") {
+        this.pendingSections.set(fileSectionName(existing.displayPath), null);
+      }
       this.activeFiles.delete(key);
       this.pendingReviewKeys.delete(key);
+      this.hitCounts.delete(key);
       changed = true;
     }
     for (const file of [...added, ...updated]) {
       this.pendingReviewKeys.add(file.key);
+      if (file.delivery === "system") {
+        this.pendingSections.set(fileSectionName(file.displayPath), sectionValue(file));
+      }
     }
     if (changed) this.persistSnapshot();
     return { added, updated };
@@ -255,35 +357,38 @@ export class InstructionRegistry {
   registerDelivered(file: DiscoveredFile): InstructionFile {
     const existing = this.activeFiles.get(file.key);
     if (existing !== undefined) {
-      existing.usedSinceCompact = true;
       existing.fingerprint = file.fingerprint;
+      if (existing.content !== file.content && existing.delivery === "system") {
+        this.pendingSections.set(fileSectionName(existing.displayPath), sectionValue(file));
+      }
       existing.content = file.content;
       this.persistSnapshot();
       return existing;
     }
-    const record: InstructionFile = { ...file, delivery: "toolResult", usedSinceCompact: true };
+    const record: InstructionFile = { ...file, delivery: "toolResult" };
     this.activeFiles.set(record.key, record);
     this.persistSnapshot();
     return record;
   }
 
   /**
-   * Age every active file by one compaction cycle. Files used during the
-   * cycle are retained and demoted to "unused" for the next one; files
-   * that were already unused expire and return on the next file access in
-   * their directory. Retained files are promoted to system delivery, since
-   * the tool results that carried deferred instructions may be compacted
-   * away while the registry entry lives on.
+   * Retain the ranked, budgeted files and start a fresh hit cycle. Selected
+   * tool-result files move to system delivery because their tool results may
+   * be compacted away.
    */
-  ageForCompaction(): void {
+  ageForCompaction(limits: Pick<ExtensionConfig, "maxBytes" | "maxFiles">): void {
+    const kept = new Set(this.carryOver(limits).map((file) => file.key));
     for (const [key, file] of this.activeFiles) {
-      if (!file.usedSinceCompact) {
+      if (!kept.has(key)) {
         this.activeFiles.delete(key);
+        this.pendingReviewKeys.delete(key);
         continue;
       }
-      file.usedSinceCompact = false;
       file.delivery = "system";
     }
+    this.hitCounts.clear();
+    this.pendingSections.clear();
     this.persistSnapshot();
+    this.persistHits();
   }
 }

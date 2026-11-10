@@ -3,9 +3,17 @@
  * the status command, notifications, and parallel tool batches.
  */
 
-import { chmodSync, existsSync, symlinkSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { getCurrentSystemMessage, getCurrentTools, type JsonObject } from "@earendil-works/pi-ai";
+import {
+  getCurrentSystemMessage,
+  getCurrentTools,
+  type JsonObject,
+  type SystemMessage,
+} from "@earendil-works/pi-ai";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
 import {
   assistantText,
@@ -21,7 +29,6 @@ import {
   NESTED_MARKER,
   nativeSectionOf,
   notifyCapture,
-  persistedSectionPatches,
   readCall,
   sectionOf,
   snapshotCount,
@@ -394,7 +401,7 @@ describe("delivery and blocking", () => {
       // The first compaction retains the used file in its own section...
       await harness.session.compact();
       await harness.session.prompt("continue");
-      expect(sectionOf(harness.faux.requests[2])).toContain(NESTED_MARKER);
+      expect(sectionOf(harness.faux.requests[2])).not.toContain(NESTED_MARKER);
       // ...and an unused cycle expires and removes it cleanly.
       await harness.session.compact();
       await harness.session.prompt("continue again");
@@ -462,17 +469,26 @@ describe("delivery and blocking", () => {
         toolResultTexts(harness.sessionManager).every((text) => !text.includes(DEFERRED_LEAD_IN)),
       ).toBe(true);
 
-      // Every request after discovery ends with exactly one ephemeral patch.
+      // The patch stays at the same position as the conversation grows.
       for (const request of [harness.faux.requests[1], harness.faux.requests[2]]) {
-        const patch = lastMessage(request);
-        expect(patch?.role).toBe("system");
-        expect(patch?.sections?.pi_agents_md).toContain(NESTED_MARKER);
-        expect(patch?.sections?.pi_agents_md).toContain("tests: run with vitest");
-        // The patch retains the leading system message, tool declarations, and other sections.
+        const patchIndex = request.messages.findIndex(
+          (message) =>
+            message.role === "system" &&
+            Object.keys(message.sections ?? {}).some((name) =>
+              name.startsWith("pi_agents_md_file_"),
+            ),
+        );
+        expect(request.messages[patchIndex - 1]?.role).toBe("toolResult");
+        const patch = request.messages[patchIndex] as SystemMessage;
+        expect(sectionOf(request)).toContain("tests: run with vitest");
         expect(request.messages[0]?.role).toBe("system");
         expect(getCurrentTools(request.messages).map((tool) => tool.name)).toContain("read");
-        expect(Object.keys(patch?.sections ?? {})).toEqual(["pi_agents_md"]);
+        expect(Object.keys(patch?.sections ?? {})).toHaveLength(1);
+        expect(Object.keys(patch?.sections ?? {})[0]).toMatch(/^pi_agents_md_file_/);
       }
+      expect(
+        harness.faux.requests[2].messages.slice(0, harness.faux.requests[1].messages.length),
+      ).toEqual(harness.faux.requests[1].messages);
       const sections = getCurrentSystemMessage(harness.faux.requests[1].messages)?.sections ?? {};
       expect(sections.preamble).toContain("coding assistant");
       expect(sections.rules).toContain("read");
@@ -484,7 +500,143 @@ describe("delivery and blocking", () => {
     }
   });
 
-  it("records a durable patch at the next run and stops reapplying the ephemeral one", {
+  it("adds only new files to the system prompt and keeps their patch fixed across tool calls", {
+    timeout: 30000,
+  }, async () => {
+    const project = makeProject();
+    let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+    try {
+      project.write("tests/AGENTS.md", "tests: run with vitest");
+      project.write("tests/file.txt", "x");
+      project.write("docs/AGENTS.md", "docs: use kebab-case filenames");
+      project.write("docs/file.txt", "d");
+      harness = await createHarness({
+        cwd: project.dir,
+        model: fauxModel({ supportsMidConvoSystemMessages: true }),
+        responses: [
+          readCall("tests/file.txt"),
+          assistantText("done"),
+          readCall("docs/file.txt"),
+          readCall("docs/file.txt"),
+          assistantText("done again"),
+          readCall("tests/file.txt"),
+          assistantText("updated"),
+          readCall("tests/file.txt"),
+          readCall("tests/file.txt"),
+          assistantText("removed"),
+        ],
+      });
+      await harness.session.prompt("read tests");
+      await harness.session.prompt("read docs twice");
+
+      const first = harness.faux.requests[3];
+      const next = harness.faux.requests[4];
+      const latestPatch = first.messages.filter((message) => message.role === "system").at(-1);
+      expect(latestPatch?.sections && Object.values(latestPatch.sections).join("")).toContain(
+        "docs: use kebab-case filenames",
+      );
+      expect(JSON.stringify(latestPatch)).not.toContain("tests: run with vitest");
+      expect(next.messages.slice(0, first.messages.length)).toEqual(first.messages);
+      const systemText = first.messages
+        .filter((message) => message.role === "system")
+        .flatMap((message) => Object.values(message.sections ?? {}))
+        .join("\n");
+      expect(systemText.split("tests: run with vitest")).toHaveLength(2);
+      expect(systemText.split("docs: use kebab-case filenames")).toHaveLength(2);
+
+      project.write("tests/AGENTS.md", "tests: run with vitest and lint");
+      await harness.session.prompt("read tests again");
+      const updated = harness.faux.requests[6];
+      const updatePatch = updated.messages.filter((message) => message.role === "system").at(-1);
+      expect(JSON.stringify(updatePatch)).toContain("tests: run with vitest and lint");
+      expect(JSON.stringify(updatePatch)).not.toContain("docs: use kebab-case filenames");
+      expect(sectionOf(updated)).toContain("tests: run with vitest and lint");
+      expect(sectionOf(updated)).toContain("docs: use kebab-case filenames");
+
+      rmSync(project.path("tests/AGENTS.md"));
+      await harness.session.prompt("read tests after deletion");
+      const removed = harness.faux.requests[8];
+      const removalPatch = removed.messages.filter((message) => message.role === "system").at(-1);
+      expect(removalPatch?.sections?.[Object.keys(updatePatch?.sections ?? {})[0]]).toBeNull();
+      expect(sectionOf(removed)).not.toContain(NESTED_MARKER);
+      expect(sectionOf(removed)).toContain("docs: use kebab-case filenames");
+      expect(harness.faux.requests[9].messages.slice(0, removed.messages.length)).toEqual(
+        removed.messages,
+      );
+    } finally {
+      harness?.cleanup();
+      project.cleanup();
+    }
+  });
+
+  it("migrates a persisted combined section to per-file sections", { timeout: 30000 }, async () => {
+    const project = makeProject();
+    const sessionDir = mkdtempSync(join(tmpdir(), "pi-agents-autoload-sessions-"));
+    let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+    try {
+      project.write("tests/AGENTS.md", "tests: run with vitest");
+      project.write("tests/file.txt", "x");
+      const saved = SessionManager.create(project.dir, sessionDir);
+      saved.appendMessage({
+        role: "system",
+        content: "",
+        sections: { pi_agents_md: "<pi_agents_md>\nold combined section\n</pi_agents_md>" },
+        timestamp: Date.now(),
+      });
+      saved.appendCustomEntry("pi-agents-autoload", {
+        files: [
+          {
+            path: "tests/AGENTS.md",
+            content: "tests: run with vitest",
+            delivery: "system",
+          },
+        ],
+      });
+      saved.appendMessage({
+        role: "user",
+        content: [{ type: "text", text: "previous turn" }],
+        timestamp: Date.now(),
+      });
+      saved.appendMessage(assistantText("finished"));
+      saved.appendMessage({
+        role: "system",
+        content: "",
+        sections: { pi_agents_md_file_legacy: "old per-file section" },
+        timestamp: Date.now(),
+      });
+      harness = await createHarness({
+        cwd: project.dir,
+        sessionDir,
+        sessionFile: saved.getSessionFile() ?? "",
+        sessionStartEvent: { type: "session_start", reason: "resume" },
+        model: fauxModel({ supportsMidConvoSystemMessages: true }),
+        responses: [readCall("tests/file.txt"), assistantText("continued")],
+      });
+      await harness.session.prompt("continue");
+
+      const request = harness.faux.requests[0];
+      expect(harness.faux.requests[1].messages.slice(0, request.messages.length)).toEqual(
+        request.messages,
+      );
+      expect(getCurrentSystemMessage(request.messages)?.sections?.pi_agents_md).toBeUndefined();
+      expect(sectionOf(request)).toContain("tests: run with vitest");
+      const persisted = harness.sessionManager
+        .getBranch()
+        .filter((entry) => entry.type === "message");
+      expect(
+        persisted.some(
+          (entry) =>
+            entry.message.role === "system" && entry.message.sections?.pi_agents_md === null,
+        ),
+      ).toBe(true);
+    } finally {
+      harness?.cleanup();
+      rmSync(sessionDir, { recursive: true, force: true });
+      project.cleanup();
+    }
+  });
+
+  it("replays the same anchored section at the next run", {
     timeout: 30000,
   }, async () => {
     const project = makeProject();
@@ -500,14 +652,69 @@ describe("delivery and blocking", () => {
       await harness.session.prompt("read the file");
       await harness.session.prompt("continue");
 
-      // A native system-message section update is persisted on the branch.
-      const patches = persistedSectionPatches(harness.sessionManager);
-      expect(patches.some((section) => section?.includes(NESTED_MARKER))).toBe(true);
+      const patches = harness.sessionManager
+        .getBranch()
+        .filter(
+          (entry) => entry.type === "custom" && entry.customType === "pi-agents-autoload-sections",
+        );
+      expect(patches).toHaveLength(1);
 
-      // The next run's request relies on the durable patch: no ephemeral one at the end.
+      // The same request-time patch stays after its original tool result.
       const thirdRequest = harness.faux.requests[2];
       expect(lastMessage(thirdRequest)?.role).not.toBe("system");
       expect(sectionOf(thirdRequest)).toContain(NESTED_MARKER);
+    } finally {
+      harness?.cleanup();
+      project.cleanup();
+    }
+  });
+
+  it("anchors sections after a nested read batch", { timeout: 30000 }, async () => {
+    const project = makeProject();
+    let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+    try {
+      project.write("tests/a/AGENTS.md", "alpha nested instructions");
+      project.write("tests/a/file.txt", "a");
+      project.write("tests/b/AGENTS.md", "beta nested instructions");
+      project.write("tests/b/file.txt", "b");
+      harness = await createHarness({
+        cwd: project.dir,
+        model: fauxModel({ supportsMidConvoSystemMessages: true }),
+        withNestedReadHelper: true,
+        responses: [
+          assistantToolCalls([
+            {
+              name: "nested_reads",
+              args: { paths: ["tests/a/file.txt", "tests/b/file.txt"] },
+            },
+          ]),
+          assistantText("done"),
+          assistantText("continued"),
+        ],
+      });
+      await harness.session.prompt("read both files");
+      const request = harness.faux.requests[1];
+      expect(request.messages.at(-2)?.role).toBe("toolResult");
+      expect(request.messages.at(-1)?.role).toBe("system");
+      const branch = harness.sessionManager.getBranch();
+      const result = branch
+        .filter((entry) => entry.type === "message" && entry.message.role === "toolResult")
+        .at(-1);
+      const patch = branch
+        .filter(
+          (entry) => entry.type === "custom" && entry.customType === "pi-agents-autoload-sections",
+        )
+        .at(-1);
+      expect(patch?.type === "custom" ? (patch.data as { afterId: string }).afterId : "").toBe(
+        result?.id,
+      );
+      expect(sectionOf(request)).toContain("alpha nested instructions");
+      expect(sectionOf(request)).toContain("beta nested instructions");
+      await harness.session.prompt("continue");
+      expect(harness.faux.requests[2].messages.slice(0, request.messages.length)).toEqual(
+        request.messages,
+      );
+      expect(harness.extensionErrors).toEqual([]);
     } finally {
       harness?.cleanup();
       project.cleanup();
@@ -532,9 +739,9 @@ describe("delivery and blocking", () => {
       await harness.session.prompt("read the file");
 
       expect(toolResultTexts(harness.sessionManager)[0]).not.toContain(DEFERRED_LEAD_IN);
-      const patch = lastMessage(harness.faux.requests[1]);
+      const patch = harness.faux.requests[1].messages.at(-1);
       expect(patch?.role).toBe("system");
-      expect(patch?.sections?.pi_agents_md).toContain(NESTED_MARKER);
+      expect(sectionOf(harness.faux.requests[1])).toContain(NESTED_MARKER);
     } finally {
       harness?.cleanup();
       project.cleanup();
@@ -567,7 +774,7 @@ describe("/agents-md-status", () => {
     }
   });
 
-  it("lists native and nested files with delivery and mode", { timeout: 30000 }, async () => {
+  it("groups native and managed files with hits and mode", { timeout: 30000 }, async () => {
     const project = makeProject();
     let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
     try {
@@ -592,8 +799,9 @@ describe("/agents-md-status", () => {
       expect(notifications[0]).toContain(
         "Mid-convo system: yes | Mode: auto (default) → immediate",
       );
-      expect(notifications[0]).toMatch(/1 {2}AGENTS\.md \(Pi, ~\d+ tokens\)/);
-      expect(notifications[0]).toMatch(/2 {2}tests\/AGENTS\.md \(System, ~\d+ tokens\)/);
+      expect(notifications[0]).toMatch(/ {2}- AGENTS\.md +\(~\d+ tokens\)/);
+      expect(notifications[0]).toMatch(/ {2}- tests\/AGENTS\.md +\(~\d+ tokens · 1 hit\)/);
+      expect(notifications[0]).toContain("  ---------- Not carried over ----------");
       expect(notifications[0]).toContain("2 files | ~");
     } finally {
       harness?.cleanup();
@@ -1306,7 +1514,7 @@ describe("explicit instruction reads", () => {
 
       notifications.length = 0;
       await harness.session.prompt("/agents-md-status");
-      expect(notifications[0]).toMatch(/1 {2}tests\/AGENTS\.md \(Tool result, ~\d+ tokens\)/);
+      expect(notifications[0]).toMatch(/ {2}- tests\/AGENTS\.md +\(~\d+ tokens · 3 hits\)/);
     } finally {
       harness?.cleanup();
       project.cleanup();
