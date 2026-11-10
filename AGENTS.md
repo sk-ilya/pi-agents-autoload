@@ -9,7 +9,7 @@ scripted model.
 - Node.js >= 22.20 (stable `path.matchesGlob`), no runtime dependencies.
 - `npm run check` runs Biome, TypeScript, and Vitest; it must pass before
   committing.
-- Target Pi 1.5.1 public APIs (`@earendil-works/pi-coding-agent`,
+- Target Pi 1.5.2 public APIs (`@earendil-works/pi-coding-agent`,
   `@earendil-works/pi-ai`); do not import private Pi internals.
 - Try changes without installing: `pi -e ./src/index.ts`. Disable any installed
   copy first to avoid loading the extension twice.

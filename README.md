@@ -4,7 +4,7 @@ Progressive `AGENTS.md` discovery and loading for [Pi](https://github.com/badlog
 
 Pi loads instructions from the working directory and its ancestors at startup. This extension discovers nested `AGENTS.md` files as the agent works, loading only relevant instructions instead of including them all in the initial context.
 
-Tested with Pi 1.5.1.
+Tested with Pi 1.5.2.
 
 ## Features
 
